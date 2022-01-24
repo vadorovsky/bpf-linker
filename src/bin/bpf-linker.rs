@@ -226,6 +226,7 @@ fn main() {
         disable_expand_memcpy_in_order,
         disable_memory_builtins,
         mut export,
+        strip_debug,
         ..
     } = cli;
 
@@ -258,6 +259,7 @@ fn main() {
         llvm_args,
         disable_expand_memcpy_in_order,
         disable_memory_builtins,
+        strip_debug,
     };
 
     if let Err(e) = Linker::new(options).link() {
