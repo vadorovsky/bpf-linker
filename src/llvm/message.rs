@@ -1,6 +1,7 @@
 use std::ffi::CStr;
 use std::fmt;
 use std::ptr;
+use std::str;
 
 use libc::c_char;
 use llvm_sys::core::LLVMDisposeMessage;
@@ -19,12 +20,20 @@ impl Message {
         }
     }
 
+    pub fn from_ptr(ptr: *mut ::libc::c_char) -> Self {
+        Message { ptr }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ptr.is_null()
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut *mut c_char {
         &mut self.ptr
+    }
+
+    pub fn to_str(&self) -> Result<&str, str::Utf8Error> {
+        unsafe { CStr::from_ptr(self.ptr) }.to_str()
     }
 }
 

@@ -22,6 +22,7 @@ ar = { version = "0.8", optional = true }
 log = { version = "0.4", optional = true }
 llvm-sys = { version = "160", optional = true }
 aya-rustc-llvm-proxy = { version = "0.5.0", optional = true }
+gimli = "0.26.2"
 
 [dev-dependencies]
 compiletest_rs = { version = "0.5", path = "third-party/compiletest-rs" }
@@ -41,3 +42,6 @@ cli = ["clap", "simplelog"]
 system-llvm = ["cli", "lib", "llvm-sys"]
 rust-llvm = ["cli", "lib", "llvm-proxy"]
 default = ["rust-llvm"]
+
+[patch.crates-io]
+llvm-sys = { git = "https://github.com/davibe/llvm-sys.rs.git", branch = "add-replace-md-operand", optional = true }
