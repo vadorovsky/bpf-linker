@@ -68,3 +68,33 @@ llvm_iterator!(
     LLVMGetFirstGlobalAlias,
     LLVMGetNextGlobalAlias
 );
+
+llvm_iterator!(
+    IterModuleNamedMDNode,
+    NamedMDNodeIter,
+    LLVMModuleRef,
+    named_metadata_iter,
+    LLVMNamedMDNodeRef,
+    LLVMGetFirstNamedMetadata,
+    LLVMGetNextNamedMetadata
+);
+
+llvm_iterator!(
+    IterBasicBlocks,
+    BasicBlockIter,
+    LLVMValueRef,
+    basic_blocks_iter,
+    LLVMBasicBlockRef,
+    LLVMGetFirstBasicBlock,
+    LLVMGetNextBasicBlock
+);
+
+llvm_iterator!(
+    IterInstructions,
+    InstructionsIter,
+    LLVMBasicBlockRef,
+    instructions_iter,
+    LLVMValueRef,
+    LLVMGetFirstInstruction,
+    LLVMGetNextInstruction
+);

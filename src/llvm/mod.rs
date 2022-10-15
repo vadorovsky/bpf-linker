@@ -1,8 +1,10 @@
+mod di;
+mod dw_tag;
 mod iter;
 mod message;
 
+use std::collections::HashSet;
 use std::{
-    collections::HashSet,
     ffi::{c_void, CStr, CString},
     os::raw::c_char,
     ptr, slice,
@@ -11,7 +13,7 @@ use std::{
 use libc::c_char as libc_char;
 use llvm_sys::bit_reader::*;
 use llvm_sys::core::*;
-use llvm_sys::debuginfo::LLVMStripModuleDebugInfo;
+
 use llvm_sys::linker::LLVMLinkModules2;
 use llvm_sys::object::*;
 use llvm_sys::prelude::*;
@@ -24,6 +26,7 @@ use llvm_sys::LLVMAttributeFunctionIndex;
 use llvm_sys::{LLVMLinkage, LLVMVisibility};
 use log::*;
 
+pub use self::di::DIFix;
 use self::message::Message;
 use crate::OptLevel;
 use iter::{IterModuleFunctions, IterModuleGlobalAliases, IterModuleGlobals};
@@ -255,9 +258,11 @@ unsafe fn module_asm_is_probestack(module: LLVMModuleRef) -> bool {
 
 fn symbol_name(value: *mut llvm_sys::LLVMValue) -> String {
     let mut name_len = 0;
-    unsafe { CStr::from_ptr(LLVMGetValueName2(value, &mut name_len)) }
-        .to_string_lossy()
-        .to_string()
+    unsafe { to_string(LLVMGetValueName2(value, &mut name_len)) }
+}
+
+unsafe fn to_string(chars: *const ::libc::c_char) -> String {
+    CStr::from_ptr(chars).to_string_lossy().to_string()
 }
 
 unsafe fn remove_attribute(function: *mut llvm_sys::LLVMValue, name: &str) {
