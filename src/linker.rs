@@ -391,6 +391,17 @@ impl Linker {
     }
 
     fn optimize(&mut self) -> Result<(), LinkerError> {
+        if let Some(path) = &self.options.dump_module {
+            // dump IR before optimization
+            let path = CString::new(
+                path.with_extension("pre-opt.ll")
+                    .as_os_str()
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            self.write_ir(&path)?;
+        };
         if !self.options.disable_memory_builtins {
             self.options.export_symbols.extend(
                 ["memcpy", "memmove", "memset", "memcmp", "bcmp"]
