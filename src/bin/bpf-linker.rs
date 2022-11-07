@@ -153,8 +153,8 @@ struct CommandLine {
     _no_entry: bool,
     #[clap(long = "gc-sections", hidden = true)]
     _gc_sections: bool,
-    #[clap(long = "strip-debug", hidden = true)]
-    _strip_debug: bool,
+    #[clap(long = "strip-debug")]
+    strip_debug: bool,
     #[clap(long = "strip-all", hidden = true)]
     _strip_all: bool,
 }
