@@ -160,7 +160,13 @@ struct CommandLine {
 }
 
 fn main() {
+    use std::io::Write;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let mut f = std::fs::File::create(format!("/tmp/bpf-linker-{uuid}.txt")).unwrap();
+    f.write_all(b"args:\n\n").unwrap();
     let args = env::args().map(|arg| {
+        f.write_all(arg.as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
         if arg == "-flavor" {
             "--flavor".to_string()
         } else {
@@ -168,6 +174,18 @@ fn main() {
         }
     });
     let cli = CommandLine::from_iter(args);
+
+    f.write_all(b"\ninputs:\n\n").unwrap();
+    for input in &cli.inputs {
+        f.write_all(input.to_string_lossy().as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+    }
+
+    f.write_all(b"\nexports:\n\n").unwrap();
+    for export in &cli.export {
+        f.write_all(export.as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+    }
 
     if cli.inputs.is_empty() {
         error("no input files", clap::ErrorKind::TooFewValues);
