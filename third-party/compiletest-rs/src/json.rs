@@ -69,7 +69,7 @@ struct DiagnosticCode {
     /// The code itself.
     code: String,
     /// An explanation for the code.
-    explanation: Option<String>,
+    _explanation: Option<String>,
 }
 
 pub fn extract_rendered(output: &str, proc_res: &ProcRes) -> String {
