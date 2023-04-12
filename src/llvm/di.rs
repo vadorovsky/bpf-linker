@@ -4,6 +4,7 @@ use super::symbol_name;
 use crate::llvm::iter::*;
 use crate::llvm::to_string;
 use gimli::constants::DwTag;
+use gimli::DW_TAG_pointer_type;
 use gimli::DW_TAG_structure_type;
 use gimli::DW_TAG_variant_part;
 use llvm_sys::core::*;
@@ -45,6 +46,20 @@ impl DIFix {
                 #[allow(non_upper_case_globals)]
                 match tag {
                     Some(DW_TAG_structure_type) => {
+                        let mut len = 0;
+                        let name =
+                            to_string(LLVMDITypeGetName(LLVMValueAsMetadata(value), &mut len));
+
+                        if name.starts_with("HashMap<") {
+                            // Remove name from BTF map structs.
+                            LLVMReplaceMDNodeOperandWith(value, 2, empty);
+                        } else {
+                            // Clear the name from generics.
+                            let name = name.split('<').next().unwrap();
+                            let name = to_mdstring(self.context, &name);
+                            LLVMReplaceMDNodeOperandWith(value, 2, name);
+                        }
+
                         // variadic enum not supported => emit warning and strip out the children array
                         // i.e. pub enum Foo { Bar, Baz(u32), Bad(u64, u64) }
 
@@ -127,8 +142,16 @@ impl DIFix {
                 }
             }
             LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind => {
-                // remove rust names
-                LLVMReplaceMDNodeOperandWith(value, 2, empty);
+                let tag = get_tag(value);
+
+                #[allow(non_upper_case_globals)]
+                match tag {
+                    Some(DW_TAG_pointer_type) => {
+                        // remove rust names
+                        LLVMReplaceMDNodeOperandWith(value, 2, empty);
+                    }
+                    _ => (),
+                }
             }
             _ => (),
         }
