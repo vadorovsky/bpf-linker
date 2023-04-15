@@ -1735,7 +1735,12 @@ actual:\n\
             }
 
             Some("bpf-linker") => {
-                rustc.arg("-Clink-args=--emit=asm");
+                // only add --emit if not already specified by the test itself
+                if !rustc.get_args()
+                   .filter_map(|arg| arg.to_str())
+                   .any(|arg_str| arg_str.contains("--emit")) {
+                    rustc.arg("-Clink-args=--emit=asm");
+                }
             }
 
             Some(_) => self.fatal("unknown 'assembly-output' header"),
