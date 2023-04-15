@@ -12,7 +12,6 @@ use llvm_sys::prelude::*;
 use log::*;
 use std::collections::HashSet;
 use std::ffi::CStr;
-use std::ffi::CString;
 
 pub struct DIFix {
     context: LLVMContextRef,
@@ -269,9 +268,10 @@ impl DIFix {
 
 // utils
 
-unsafe fn to_mdstring(context: LLVMContextRef, chars: &str) -> LLVMMetadataRef {
-    let cstr = CString::new(chars).unwrap();
-    LLVMMDStringInContext2(context, cstr.as_ptr(), chars.len())
+unsafe fn to_mdstring(context: LLVMContextRef, s: &str) -> LLVMMetadataRef {
+    let len = s.len();
+    let ptr = s.as_ptr() as *const i8;
+    LLVMMDStringInContext2(context, ptr, len)
 }
 
 unsafe fn iter_operands(v: LLVMValueRef) -> impl Iterator<Item = LLVMValueRef> {
