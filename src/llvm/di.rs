@@ -22,10 +22,12 @@ pub struct DIFix {
     node_stack: Vec<LLVMValueRef>,
 }
 
+// Sanitize Rust type names to be valid C type names.
 fn sanitize_type_name(name: String) -> String {
     name.chars()
         .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
+            // Characters which are valid in C type names (alphanumeric and `_`).
+            if matches!(ch, '0'..='9' | 'A'..='Z' | 'a'..='z' | '_') {
                 ch.to_string()
             } else {
                 format!("_{:X}_", ch as u32)
@@ -164,6 +166,16 @@ impl DIFix {
                     }
                     _ => (),
                 }
+            }
+            // Sanitize function (subprogram) names.
+            LLVMMetadataKind::LLVMDISubprogramMetadataKind => {
+                let mut len = 0;
+                let name = to_string(LLVMDITypeGetName(LLVMValueAsMetadata(value), &mut len));
+
+                // Clear the name from generics.
+                let name = sanitize_type_name(name);
+                let name = to_mdstring(self.context, &name);
+                LLVMReplaceMDNodeOperandWith(value, 2, name);
             }
             _ => (),
         }
@@ -402,13 +414,13 @@ mod test {
         let name = "my_function<aya_bpf::BpfContext>".to_owned();
         assert_eq!(
             sanitize_type_name(name),
-            "my_5F_function_3C_aya_5F_bpf_3A__3A_BpfContext_3E_"
+            "my_function_3C_aya_bpf_3A__3A_BpfContext_3E_"
         );
 
         let name = "my_function<aya_bpf::BpfContext, aya_log_ebpf::WriteToBuf>".to_owned();
         assert_eq!(
             sanitize_type_name(name),
-            "my_5F_function_3C_aya_5F_bpf_3A__3A_BpfContext_2C__20_aya_5F_log_5F_ebpf_3A__3A_WriteToBuf_3E_"
+            "my_function_3C_aya_bpf_3A__3A_BpfContext_2C__20_aya_log_ebpf_3A__3A_WriteToBuf_3E_"
         );
 
         let name = "PerfEventArray<[u8; 32]>".to_owned();
