@@ -22,6 +22,7 @@ use std::{
 use thiserror::Error;
 
 use crate::llvm;
+use crate::llvm::strip::strip_di;
 
 /// Linker error
 #[derive(Debug, Error)]
@@ -454,8 +455,12 @@ impl Linker {
                 self.options.ignore_inline_never,
                 &self.options.export_symbols,
             )
+            .map_err(LinkerError::OptimizeError)?;
         }
-        .map_err(LinkerError::OptimizeError)
+
+        strip_di(self.module);
+
+        Ok(())
     }
 
     fn codegen(&mut self) -> Result<(), LinkerError> {

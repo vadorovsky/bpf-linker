@@ -1,6 +1,7 @@
 use super::symbol_name;
 use super::Message;
 use crate::llvm::iter::*;
+use crate::llvm::section;
 use gimli::constants::DwTag;
 use gimli::DW_TAG_member;
 use gimli::DW_TAG_pointer_type;
@@ -199,6 +200,8 @@ impl DIFix {
                     .to_str()
                     .unwrap();
 
+                debug!("SUBPROGRAM: {}", name);
+
                 // Clear the name from generics.
                 let name = sanitize_type_name(name);
                 let name = to_mdstring(self.context, &name);
@@ -259,6 +262,13 @@ impl DIFix {
                 .to_str()
                 .unwrap()
             );
+            // let sec = section(value);
+            // if let Some(sec) = sec {
+            //     trace!("SECTION: {}", sec);
+            // }
+
+            // let empty_node = LLVMMDNodeInContext2(self.context, core::ptr::null_mut(), 0);
+            // LLVMReplaceMDNodeOperandWith(value, 0, empty_node);
         }
 
         if can_get_all_metadata(value) {
@@ -309,17 +319,54 @@ impl DIFix {
         let module = self.module;
         for (i, sym) in module.globals_iter().enumerate() {
             trace!("global index:{} name:{}", i, symbol_name(sym));
-            self.discover(sym, 0);
+            match section(sym) {
+                Some(section) => {
+                    trace!("has linking section {}, sanitizing debug info", section);
+                    self.discover(sym, 0);
+                }
+                None => {
+                    trace!("does not have linking section, stripping debug info");
+                }
+            }
+            // self.discover(sym, 0);
         }
 
         for (i, sym) in module.global_aliases_iter().enumerate() {
             trace!("global aliases index:{} name:{}", i, symbol_name(sym));
-            self.discover(sym, 0);
+            match section(sym) {
+                Some(section) => {
+                    trace!("has linking section {}, sanitizing debug info", section);
+                    self.discover(sym, 0);
+                }
+                None => {
+                    trace!("does not have linking section, stripping debug info");
+                }
+            }
+            // self.discover(sym, 0);
         }
 
         for function in module.functions_iter() {
             trace!("function > name:{}", symbol_name(function));
-            self.discover(function, 0);
+            match section(function) {
+                Some(section) => {
+                    trace!("has linking secton {}, sanitizing debug info", section);
+                    self.discover(function, 0);
+                }
+                None => {
+                    trace!("does not have linking section, stripping debug info");
+
+                    // let kind = CString::new("dbg").unwrap();
+                    // let kind_id = LLVMGetMDKindID(kind.as_ptr(), 3);
+
+                    // for basic_block in function.basic_blocks_iter() {
+                    // for instruction in basic_block.instructions_iter() {
+                    // LLVMSetMetadata(instruction, kind_id, std::ptr::null_mut());
+                    // }
+                    // }
+                    // LLVMSetMetadata(function, kind_id, std::ptr::null_mut());
+                }
+            }
+            // self.discover(function, 0);
 
             let params_count = LLVMCountParams(function);
             for i in 0..params_count {

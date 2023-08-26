@@ -1,5 +1,6 @@
 mod di;
 mod iter;
+pub mod strip;
 
 pub use di::DIFix;
 
@@ -247,6 +248,14 @@ fn symbol_name<'a>(value: *mut llvm_sys::LLVMValue) -> &'a str {
     let mut name_len = 0;
     let ptr = unsafe { LLVMGetValueName2(value, &mut name_len) };
     unsafe { CStr::from_ptr(ptr) }.to_str().unwrap()
+}
+
+fn section<'a>(value: *mut llvm_sys::LLVMValue) -> Option<&'a str> {
+    let ptr = unsafe { LLVMGetSection(value) };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
 }
 
 unsafe fn remove_attribute(function: *mut llvm_sys::LLVMValue, name: &str) {
