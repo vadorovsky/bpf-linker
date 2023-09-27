@@ -482,6 +482,8 @@ impl Linker {
     fn llvm_init(&mut self) {
         let mut args = Vec::<Cow<str>>::new();
         args.push("bpf-linker".into());
+        // starting from LLVM17 we need to disable cold callsite to avoid inlining issues
+        args.push("--cold-callsite-rel-freq=0".into());
         if self.options.unroll_loops {
             // setting cmdline arguments is the only way to customize the unroll pass with the
             // C API.
