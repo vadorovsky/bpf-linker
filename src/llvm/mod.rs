@@ -306,7 +306,7 @@ pub extern "C" fn fatal_error(reason: *const c_char) {
     error!("fatal error: {:?}", unsafe { CStr::from_ptr(reason) })
 }
 
-struct Message {
+pub struct Message {
     ptr: *mut c_char,
 }
 

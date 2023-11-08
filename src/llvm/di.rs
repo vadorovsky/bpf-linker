@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     ffi::{CStr, CString, NulError},
     hash::Hasher,
     ptr::NonNull,
@@ -11,7 +11,7 @@ use log::{trace, warn};
 
 use super::{
     ir::{MDNode, Metadata, MetadataKind, Value, ValueType},
-    symbol_name, Message,
+    symbol_name,
 };
 use crate::llvm::iter::*;
 
@@ -25,26 +25,26 @@ const MAX_KSYM_NAME_LEN: usize = 128;
 /// `DINode` is a fundamental structure used in the construction of LLVM's
 /// debugging information ecosystem. It serves as a building block for more
 /// complex debug information entities such as scopes, types and variables.
-pub struct DINode {
-    pub md_node: MDNode,
+pub struct DINode<'a> {
+    pub md_node: MDNode<'a>,
 }
 
-impl DINode {
-    /// Constructs a new [`DINode`] from the given `metadata`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the given `metadata` corresponds to a valid
-    /// instance of [LLVM `DINode`](https://llvm.org/doxygen/classllvm_1_1DINode.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any validation checks.
-    pub(crate) unsafe fn from_metadata_ref(
-        context: LLVMContextRef,
-        metadata: LLVMMetadataRef,
-    ) -> Self {
-        let md_node = MDNode::from_metadata_ref(context, metadata);
-        Self { md_node }
-    }
+impl<'a> DINode<'a> {
+    // /// Constructs a new [`DINode`] from the given `metadata`.
+    // ///
+    // /// # Safety
+    // ///
+    // /// This method assumes that the given `metadata` corresponds to a valid
+    // /// instance of [LLVM `DINode`](https://llvm.org/doxygen/classllvm_1_1DINode.html).
+    // /// It's the caller's responsibility to ensure this invariant, as this
+    // /// method doesn't perform any validation checks.
+    // pub(crate) unsafe fn from_metadata_ref(
+    //     context: LLVMContextRef,
+    //     metadata: LLVMMetadataRef,
+    // ) -> Self {
+    //     let md_node = MDNode::from_metadata_ref(context, metadata);
+    //     Self { md_node }
+    // }
 
     /// Constructs a new [`DINode`] from the given `value`.
     ///
@@ -61,31 +61,34 @@ impl DINode {
 
     /// Returns a DWARF tag for the given debug info node.
     pub fn tag(&self) -> DwTag {
-        DwTag(unsafe { LLVMGetDINodeTag(self.md_node.metadata.metadata) })
+        unsafe {
+            let metadata_ref = LLVMValueAsMetadata(self.md_node.metadata.value.value);
+            DwTag(LLVMGetDINodeTag(metadata_ref))
+        }
     }
 }
 
 /// Represents the debug information for a code scope.
-pub struct DIScope {
-    pub di_node: DINode,
+pub struct DIScope<'a> {
+    pub di_node: DINode<'a>,
 }
 
-impl DIScope {
-    /// Constructs a new [`DIScope`] from the given `metadata`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the given `metadata` corresponds to a valid
-    /// instance of [LLVM `DIScope`](https://llvm.org/doxygen/classllvm_1_1DIScope.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any validation checks.
-    pub(crate) unsafe fn from_metadata_ref(
-        context: LLVMContextRef,
-        metadata: LLVMMetadataRef,
-    ) -> Self {
-        let di_node = DINode::from_metadata_ref(context, metadata);
-        DIScope { di_node }
-    }
+impl<'a> DIScope<'a> {
+    // /// Constructs a new [`DIScope`] from the given `metadata`.
+    // ///
+    // /// # Safety
+    // ///
+    // /// This method assumes that the given `metadata` corresponds to a valid
+    // /// instance of [LLVM `DIScope`](https://llvm.org/doxygen/classllvm_1_1DIScope.html).
+    // /// It's the caller's responsibility to ensure this invariant, as this
+    // /// method doesn't perform any validation checks.
+    // pub(crate) unsafe fn from_metadata_ref(
+    //     context: LLVMContextRef,
+    //     metadata: LLVMMetadataRef,
+    // ) -> Self {
+    //     let di_node = DINode::from_metadata_ref(context, metadata);
+    //     DIScope { di_node }
+    // }
 
     /// Constructs a new [`DIScope`] from the given `value`.
     ///
@@ -100,10 +103,12 @@ impl DIScope {
         Self { di_node }
     }
 
-    pub fn file(&self, context: LLVMContextRef) -> DIFile {
+    pub fn file(&self, ctx: LLVMContextRef) -> DIFile {
         unsafe {
-            let metadata = LLVMDIScopeGetFile(self.di_node.md_node.metadata.metadata);
-            DIFile::from_metadata_ref(context, metadata)
+            let self_metadata_ref = LLVMValueAsMetadata(self.di_node.md_node.metadata.value.value);
+            let file_metadata_ref = LLVMDIScopeGetFile(self_metadata_ref);
+            let file_value_ref = LLVMMetadataAsValue(ctx, file_metadata_ref);
+            DIFile::from_value_ref(file_value_ref)
         }
     }
 }
@@ -112,24 +117,21 @@ impl DIScope {
 ///
 /// A `DIFile` debug info node, which represents a given file, is referenced by
 /// other debug info nodes which belong to the file.
-pub struct DIFile {
-    pub di_scope: DIScope,
+pub struct DIFile<'a> {
+    pub di_scope: DIScope<'a>,
 }
 
-impl DIFile {
-    /// Constructs a new [`DIFile`] from the given `metadata`.
+impl<'a> DIFile<'a> {
+    /// Constructs a new [`DIFile`] from the given `value`.
     ///
     /// # Safety
     ///
-    /// This method assumes that the given `metadata` corresponds to a valid
+    /// This method assumes that the given `value` corresponds to a valid
     /// instance of [LLVM `DIFile`](https://llvm.org/doxygen/classllvm_1_1DIFile.html).
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any validation checks.
-    pub(crate) unsafe fn from_metadata_ref(
-        context: LLVMContextRef,
-        metadata: LLVMMetadataRef,
-    ) -> Self {
-        let di_scope = DIScope::from_metadata_ref(context, metadata);
+    pub(crate) unsafe fn from_value_ref(value: LLVMValueRef) -> Self {
+        let di_scope = DIScope::from_value_ref(value);
         Self { di_scope }
     }
 
@@ -142,7 +144,9 @@ impl DIFile {
         // Therefore, we don't need to call `LLVMDisposeMessage`. The memory
         // gets freed when calling `LLVMDisposeDIBuilder`.
         let ptr = unsafe {
-            LLVMDIFileGetFilename(self.di_scope.di_node.md_node.metadata.metadata, &mut len)
+            let metadata_ref =
+                LLVMValueAsMetadata(self.di_scope.di_node.md_node.metadata.value.value);
+            LLVMDIFileGetFilename(metadata_ref, &mut len)
         };
         NonNull::new(ptr as *mut _).map(|ptr| unsafe { CStr::from_ptr(ptr.as_ptr()) })
     }
@@ -159,11 +163,11 @@ enum DITypeOperand {
 }
 
 /// Represents the debug information for a primitive type in LLVM IR.
-pub struct DIType {
-    pub di_scope: DIScope,
+pub struct DIType<'a> {
+    pub di_scope: DIScope<'a>,
 }
 
-impl DIType {
+impl<'a> DIType<'a> {
     /// Constructs a new [`DIType`] from the given `value`.
     ///
     /// # Safety
@@ -187,27 +191,40 @@ impl DIType {
         // Therefore, we don't need to call `LLVMDisposeMessage`. The memory
         // gets freed when calling `LLVMDisposeDIBuilder`. Example:
         // https://github.com/llvm/llvm-project/blob/eee1f7cef856241ad7d66b715c584d29b1c89ca9/llvm/tools/llvm-c-test/debuginfo.c#L249-L255
-        let ptr =
-            unsafe { LLVMDITypeGetName(self.di_scope.di_node.md_node.metadata.metadata, &mut len) };
+        let ptr = unsafe {
+            let metadata_ref =
+                LLVMValueAsMetadata(self.di_scope.di_node.md_node.metadata.value.value);
+            LLVMDITypeGetName(metadata_ref, &mut len)
+        };
         NonNull::new(ptr as *mut _).map(|ptr| unsafe { CStr::from_ptr(ptr.as_ptr()) })
     }
 
     /// Returns the flags associated with the type.
     pub fn flags(&self) -> LLVMDIFlags {
-        unsafe { LLVMDITypeGetFlags(self.di_scope.di_node.md_node.metadata.metadata) }
+        unsafe {
+            let metadata_ref =
+                LLVMValueAsMetadata(self.di_scope.di_node.md_node.metadata.value.value);
+            LLVMDITypeGetFlags(metadata_ref)
+        }
     }
 
     /// Returns the offset of the type in bits. This offset is used in case the
     /// type is a member of a composite type.
     pub fn offset_in_bits(&self) -> usize {
         unsafe {
-            LLVMDITypeGetOffsetInBits(self.di_scope.di_node.md_node.metadata.metadata) as usize
+            let metadata_ref =
+                LLVMValueAsMetadata(self.di_scope.di_node.md_node.metadata.value.value);
+            LLVMDITypeGetOffsetInBits(metadata_ref) as usize
         }
     }
 
     /// Returns the line number in the source code where the type is defined.
     pub fn line(&self) -> u32 {
-        unsafe { LLVMDITypeGetLine(self.di_scope.di_node.md_node.metadata.metadata) }
+        unsafe {
+            let metadata_ref =
+                LLVMValueAsMetadata(self.di_scope.di_node.md_node.metadata.value.value);
+            LLVMDITypeGetLine(metadata_ref)
+        }
     }
 
     /// Replaces the name of the type with a new name.
@@ -220,7 +237,7 @@ impl DIType {
         unsafe {
             let name = LLVMMDStringInContext2(context, CString::new(name)?.as_ptr(), name.len());
             LLVMReplaceMDNodeOperandWith(
-                self.di_scope.di_node.md_node.metadata.value,
+                self.di_scope.di_node.md_node.metadata.value.value,
                 DITypeOperand::Name as u32,
                 name,
             )
@@ -243,11 +260,11 @@ enum DIDerivedTypeOperand {
 /// The types derived from other types usually add a level of indirection or an
 /// alternative name. The examples of derived types are pointers, references,
 /// typedefs, etc.
-pub struct DIDerivedType {
-    di_type: DIType,
+pub struct DIDerivedType<'a> {
+    di_type: DIType<'a>,
 }
 
-impl DIDerivedType {
+impl<'a> DIDerivedType<'a> {
     /// Constructs a new [`DIDerivedType`] from the given `value`.
     ///
     /// # Safety
@@ -265,7 +282,7 @@ impl DIDerivedType {
     pub fn base_type(&self) -> Metadata {
         unsafe {
             let value = LLVMGetOperand(
-                self.di_type.di_scope.di_node.md_node.metadata.value,
+                self.di_type.di_scope.di_node.md_node.metadata.value.value,
                 DIDerivedTypeOperand::BaseType as u32,
             );
             Metadata::from_value_ref(value)
@@ -296,11 +313,11 @@ enum DICompositeTypeOperand {
 ///
 /// Composite type is a kind of type that can include other types, such as
 /// structures, enums, unions, etc.
-pub struct DICompositeType {
-    di_type: DIType,
+pub struct DICompositeType<'a> {
+    di_type: DIType<'a>,
 }
 
-impl DICompositeType {
+impl<'a> DICompositeType<'a> {
     /// Constructs a new [`DICompositeType`] from the given `value`.
     ///
     /// # Safety
@@ -326,10 +343,10 @@ impl DICompositeType {
 
     /// Returns an iterator over elements (struct fields, enum variants, etc.)
     /// of the composite type.
-    pub fn elements(&self) -> impl Iterator<Item = Metadata> {
+    pub fn elements(&mut self) -> impl Iterator<Item = Metadata> {
         let elements = unsafe {
             LLVMGetOperand(
-                self.di_type.di_scope.di_node.md_node.metadata.value,
+                self.di_type.di_scope.di_node.md_node.metadata.value.value,
                 DICompositeTypeOperand::Elements as u32,
             )
         };
@@ -351,26 +368,27 @@ impl DICompositeType {
 
     /// Replaces the elements of the composite type with a new metadata node.
     /// The provided metadata node should contain new composite type elements
-    /// as operants. The metadata node can be empty if the intention is to
+    /// as operands. The metadata node can be empty if the intention is to
     /// remove all elements of the composite type.
     pub fn replace_elements(&mut self, mdnode: MDNode) {
-        let value = self.di_type.di_scope.di_node.md_node.metadata.value;
+        let value = self.di_type.di_scope.di_node.md_node.metadata.value.value;
         unsafe {
+            let mdnode_metadata_ref = LLVMValueAsMetadata(mdnode.metadata.value.value);
             LLVMReplaceMDNodeOperandWith(
                 value,
                 DICompositeTypeOperand::Elements as u32,
-                mdnode.metadata.metadata,
+                mdnode_metadata_ref,
             )
         }
     }
 }
 
 /// Represents the debug information for a variable in LLVM IR.
-pub struct DIVariable {
-    pub di_node: DINode,
+pub struct DIVariable<'a> {
+    pub di_node: DINode<'a>,
 }
 
-impl DIVariable {
+impl<'a> DIVariable<'a> {
     /// Constructs a new [`DIVariable`] from the given `value`.
     ///
     /// # Safety
@@ -386,11 +404,11 @@ impl DIVariable {
 }
 
 /// Represents the debug information for a global variable in LLVM IR.
-pub struct DIGlobalVariable {
-    pub di_variable: DIVariable,
+pub struct DIGlobalVariable<'a> {
+    pub di_variable: DIVariable<'a>,
 }
 
-impl DIGlobalVariable {
+impl<'a> DIGlobalVariable<'a> {
     /// Constructs a new [`DIGlobalVariable`] from the given `value`.
     ///
     /// # Safety
@@ -406,11 +424,11 @@ impl DIGlobalVariable {
 }
 
 /// Represents the debug information for a common block in LLVM IR.
-pub struct DICommonBlock {
-    pub di_scope: DIScope,
+pub struct DICommonBlock<'a> {
+    pub di_scope: DIScope<'a>,
 }
 
-impl DICommonBlock {
+impl<'a> DICommonBlock<'a> {
     /// Constructs a new [`DICommonBlock`] from the given `value`.
     ///
     /// # Safety
@@ -426,11 +444,11 @@ impl DICommonBlock {
 }
 
 /// Represents the debug information for a local scope in LLVM IR.
-pub struct DILocalScope {
-    pub di_scope: DIScope,
+pub struct DILocalScope<'a> {
+    pub di_scope: DIScope<'a>,
 }
 
-impl DILocalScope {
+impl<'a> DILocalScope<'a> {
     /// Constructs a new [`DILocalScope`] from the given `value`.
     ///
     /// # Safety
@@ -453,11 +471,11 @@ enum DISubprogramOperand {
 }
 
 /// Represents the debug information for a subprogram (function) in LLVM IR.
-pub struct DISubprogram {
-    pub di_local_scope: DILocalScope,
+pub struct DISubprogram<'a> {
+    pub di_local_scope: DILocalScope<'a>,
 }
 
-impl DISubprogram {
+impl<'a> DISubprogram<'a> {
     /// Constructs a new [`DISubprogram`] from the given `value`.
     ///
     /// # Safety
@@ -473,7 +491,14 @@ impl DISubprogram {
 
     /// Returns the name of the subprogram.
     pub fn name(&self) -> Option<&CStr> {
-        let value = self.di_local_scope.di_scope.di_node.md_node.metadata.value;
+        let value = self
+            .di_local_scope
+            .di_scope
+            .di_node
+            .md_node
+            .metadata
+            .value
+            .value;
         let operand = unsafe { LLVMGetOperand(value, DISubprogramOperand::Name as u32) };
         let mut len = 0;
         // `LLVMGetMDString` doesn't allocate any memory, it just returns a
@@ -494,7 +519,14 @@ impl DISubprogram {
     /// Returns a `NulError` if the new name contains a NUL byte, as it cannot
     /// be converted into a `CString`.
     pub fn replace_name(&mut self, context: LLVMContextRef, name: &str) -> Result<(), NulError> {
-        let value = self.di_local_scope.di_scope.di_node.md_node.metadata.value;
+        let value = self
+            .di_local_scope
+            .di_scope
+            .di_node
+            .md_node
+            .metadata
+            .value
+            .value;
         let name =
             unsafe { LLVMMDStringInContext2(context, CString::new(name)?.as_ptr(), name.len()) };
         unsafe { LLVMReplaceMDNodeOperandWith(value, DISubprogramOperand::Name as u32, name) };
@@ -549,7 +581,7 @@ impl DISanitizer {
         }
     }
 
-    fn mdnode(&mut self, mdnode: MDNode) {
+    fn mdnode(&mut self, mdnode: &MDNode) {
         match mdnode.metadata.into_metadata_kind() {
             MetadataKind::DICompositeType(mut di_composite_type) => {
                 #[allow(clippy::single_match)]
@@ -576,7 +608,8 @@ impl DISanitizer {
                         // i.e. pub enum Foo { Bar, Baz(u32), Bad(u64, u64) }
 
                         // we detect this is a variadic enum if the child element is a DW_TAG_variant_part
-                        let mut members = Vec::new();
+                        let mut members: Vec<DIType> = Vec::new();
+                        let mut remove_name = false;
                         for element in di_composite_type.elements() {
                             match element.into_metadata_kind() {
                                 MetadataKind::DICompositeType(mut di_composite_type) => {
@@ -639,24 +672,28 @@ impl DISanitizer {
                                                 // BTF maps accepted by the Linux kernel.
                                                 if base_type_name == "AyaBtfMapMarker" {
                                                     // Remove the name from the struct.
-                                                    di_composite_type
-                                                        .replace_name(self.context, "")
-                                                        .unwrap();
+                                                    remove_name = true;
+                                                    // di_composite_type
+                                                    //     .replace_name(self.context, "")
+                                                    //     .unwrap();
                                                     // And don't include the field in the sanitized DI.
                                                 } else {
-                                                    members.push(di_derived_type.di_type);
+                                                    // members.push(di_derived_type.di_type);
                                                 }
                                             } else {
-                                                members.push(di_derived_type.di_type);
+                                                // members.push(di_derived_type.di_type);
                                             }
                                         }
                                         _ => {
-                                            members.push(di_derived_type.di_type);
+                                            // members.push(di_derived_type.di_type);
                                         }
                                     }
                                 }
                                 _ => {}
                             }
+                        }
+                        if remove_name {
+                            di_composite_type.replace_name(self.context, "").unwrap();
                         }
                         if !members.is_empty() {
                             members.sort_by_cached_key(|di_type| di_type.offset_in_bits());
@@ -714,68 +751,94 @@ impl DISanitizer {
 
         self.node_stack.push(value);
 
-        if let ValueType::MDNode(mdnode) = Value::new(value).into_value_type() {
-            let metadata_kind = LLVMGetMetadataKind(mdnode.metadata.metadata);
-            trace!(
-                "{one:depth$}mdnode kind:{:?} n_operands:{} value: {}",
-                metadata_kind,
-                LLVMGetMDNodeNumOperands(value),
-                Message {
-                    ptr: LLVMPrintValueToString(value)
-                }
-                .as_c_str()
-                .unwrap()
-                .to_str()
-                .unwrap()
-            );
+        let value = Value::new(value);
 
-            self.mdnode(mdnode)
-        } else {
-            trace!(
-                "{one:depth$}node value: {}",
-                Message {
-                    ptr: LLVMPrintValueToString(value)
-                }
-                .as_c_str()
-                .unwrap()
-                .to_str()
-                .unwrap()
-            );
-        }
-
-        if can_get_all_metadata(value) {
-            for (index, (kind, metadata)) in iter_metadata_copy(value).enumerate() {
-                let metadata_value = LLVMMetadataAsValue(self.context, metadata);
-                trace!("{one:depth$}all_metadata entry: index:{}", index);
-                self.discover(metadata_value, depth + 1);
-
-                if is_instruction(value) {
-                    LLVMSetMetadata(value, kind, metadata_value);
-                } else {
-                    LLVMGlobalSetMetadata(value, kind, metadata);
-                }
-            }
-        }
-
-        if can_get_operands(value) {
-            for (index, operand) in iter_operands(value).enumerate() {
-                trace!(
-                    "{one:depth$}operand index:{} name:{} value:{}",
-                    index,
-                    symbol_name(value),
-                    Message {
-                        ptr: LLVMPrintValueToString(value)
+        match value.into_value_type() {
+            ValueType::User(user) => {
+                for (index, operand) in user.operands().enumerate() {
+                    match user.as_message().as_c_str() {
+                        Some(user_str) => trace!(
+                            "{one:depth$}operand index:{} name:{} value:{}",
+                            index,
+                            user.symbol_name(),
+                            user_str.to_string_lossy()
+                        ),
+                        None => warn!("failed to convert User as a string"),
                     }
-                    .as_c_str()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                );
-                self.discover(operand, depth + 1)
+                    self.discover(operand.value, depth + 1);
+                }
             }
+            ValueType::GlobalObject(mut global_object) => {
+                // let mut metadatas = HashMap::new();
+                for (index, (kind, metadata)) in global_object
+                    .iter_mut_metadata_copy(self.context)
+                    .enumerate()
+                {
+                    trace!("{one:depth$}all_metadata entry: index:{}", index);
+                    self.discover(metadata.value.value, depth + 1);
+
+                    // metadatas.insert(kind.to_owned(), metadata);
+
+                    // global_object.set_metadata(kind, &metadata)
+                }
+
+                // for (kind, metadata) in metadatas {
+                //     global_object.set_metadata(kind, &metadata);
+                // }
+            }
+            ValueType::Instruction(mut instruction) => {
+                for (index, (kind, metadata)) in
+                    instruction.iter_metadata_copy(self.context).enumerate()
+                {
+                    trace!("{one:depth$}all_metadata entry: index:{}", index);
+                    self.discover(metadata.value.value, depth + 1);
+
+                    // instruction.set_metadata(kind, &metadata);
+                }
+            }
+            ValueType::MDNode(mdnode) => {
+                let metadata_kind = mdnode.metadata_kind();
+                match mdnode.as_message().as_c_str() {
+                    Some(mdnode_str) => {
+                        trace!(
+                            "{one:depth$}mdnode kind:{:?} n_operands:{} value: {}",
+                            metadata_kind,
+                            mdnode.num_operands(),
+                            mdnode_str.to_string_lossy()
+                        );
+                    }
+                    None => trace!(
+                        "{one:depth$}mdnode kind:{:?} n_operands:{}",
+                        metadata_kind,
+                        mdnode.num_operands()
+                    ),
+                };
+
+                self.mdnode(&mdnode);
+
+                for (index, operand) in mdnode.operands().enumerate() {
+                    match mdnode.as_message().as_c_str() {
+                        Some(mdnode_str) => trace!(
+                            "{one:depth$}operand index:{} name:{} value:{}",
+                            index,
+                            mdnode.symbol_name(),
+                            mdnode_str.to_string_lossy(),
+                        ),
+                        None => {}
+                    }
+                    self.discover(operand.value, depth + 1)
+                }
+            }
+            ValueType::Unknown(value) => match value.as_message().as_c_str() {
+                Some(value_str) => {
+                    trace!("{one:depth$}node value: {}", value_str.to_string_lossy())
+                }
+                None => warn!("failed to print the value as string"),
+            },
         }
 
-        assert_eq!(self.node_stack.pop(), Some(value));
+        // assert_eq!(self.node_stack.pop(), Some(value.value));
+        let _ = self.node_stack.pop();
     }
 
     pub unsafe fn run(&mut self) {
