@@ -2,31 +2,36 @@ use std::{
     borrow::Cow,
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     ffi::c_char,
+    fmt::Debug,
     hash::Hasher,
     ptr,
 };
 
 use gimli::{DW_TAG_pointer_type, DW_TAG_structure_type, DW_TAG_variant_part};
-use llvm_sys::{core::*, debuginfo::*, prelude::*};
-use tracing::{span, trace, warn, Level};
+use llvm_sys::{core::*, debuginfo::*, prelude::*, LLVMAttributeFunctionIndex, LLVMTypeKind};
+use tracing::{debug, span, trace, warn, Level};
 
 use super::types::{
     di::DIType,
     ir::{Function, MDNode, Metadata, Value},
 };
-use crate::llvm::{iter::*, types::di::DISubprogram};
+use crate::llvm::{
+    iter::*,
+    types::{di::DISubprogram, ir::Instruction},
+};
 
 // KSYM_NAME_LEN from linux kernel intentionally set
 // to lower value found accross kernel versions to ensure
 // backward compatibility
 const MAX_KSYM_NAME_LEN: usize = 128;
 
-pub struct DISanitizer {
+pub struct DISanitizer<'ctx> {
     context: LLVMContextRef,
     module: LLVMModuleRef,
-    builder: LLVMDIBuilderRef,
+    builder: LLVMBuilderRef,
+    di_builder: LLVMDIBuilderRef,
     visited_nodes: HashSet<u64>,
-    item_stack: Vec<Item>,
+    item_stack: Vec<Item<'ctx>>,
     replace_operands: HashMap<u64, LLVMMetadataRef>,
     skipped_types: Vec<String>,
 }
@@ -59,12 +64,13 @@ fn sanitize_type_name<T: AsRef<str>>(name: T) -> String {
     n
 }
 
-impl DISanitizer {
-    pub fn new(context: LLVMContextRef, module: LLVMModuleRef) -> DISanitizer {
+impl<'ctx> DISanitizer<'ctx> {
+    pub fn new(context: LLVMContextRef, module: LLVMModuleRef) -> DISanitizer<'ctx> {
         DISanitizer {
             context,
             module,
-            builder: unsafe { LLVMCreateDIBuilder(module) },
+            builder: unsafe { LLVMCreateBuilderInContext(context) },
+            di_builder: unsafe { LLVMCreateDIBuilder(module) },
             visited_nodes: HashSet::new(),
             item_stack: Vec::new(),
             replace_operands: HashMap::new(),
@@ -217,7 +223,7 @@ impl DISanitizer {
     }
 
     // navigate the tree of LLVMValueRefs (DFS-pre-order)
-    fn visit_item(&mut self, mut item: Item) {
+    fn visit_item(&mut self, mut item: Item<'ctx>) {
         let value_ref = item.value_ref();
         let value_id = item.value_id();
 
@@ -240,6 +246,34 @@ impl DISanitizer {
             // nodes in the tree.
             if let Some(new_metadata) = self.replace_operands.get(&value_id) {
                 operand.replace(unsafe { LLVMMetadataAsValue(self.context, *new_metadata) })
+            }
+        }
+
+        if let Item::Instruction(ref inst) = item {
+            if let Instruction::GetElementPtrInst(get_element_ptr_inst) = inst {
+                debug!("GEP FOUND: {get_element_ptr_inst:?}");
+
+                self.inject_preserve_struct_access_index(get_element_ptr_inst.value_ref());
+
+                let operands = value.operands();
+                if let Some(operands) = operands {
+                    for (i, operand) in operands.enumerate() {
+                        let operand = Value::new(operand);
+                        debug!("GEP operand {i}: {:?}", operand);
+
+                        let suboperands = operand.operands();
+                        if let Some(suboperands) = suboperands {
+                            for (i, suboperand) in suboperands.enumerate() {
+                                let suboperand = Value::new(suboperand);
+                                debug!("GEP suboperand {i}: {:?}", suboperand);
+                            }
+                        }
+                    }
+                } else {
+                    debug!("GEP has no operands");
+                }
+            } else {
+                debug!("some other instruction");
             }
         }
 
@@ -281,12 +315,75 @@ impl DISanitizer {
 
             for basic_block in fun.basic_blocks() {
                 for instruction in basic_block.instructions_iter() {
-                    self.visit_item(Item::Instruction(instruction));
+                    self.visit_item(Item::Instruction(Instruction::new(instruction)));
                 }
             }
         }
 
         let _ = self.item_stack.pop().unwrap();
+    }
+
+    fn emit_preserve_struct_access_index(
+        &mut self,
+        el_ty: LLVMTypeRef,
+        base: LLVMValueRef,
+        index: u32,
+        field_index: u32,
+        dbg_info: LLVMMetadataRef,
+    ) -> LLVMValueRef {
+        unsafe {
+            let base_type = LLVMTypeOf(base);
+            if LLVMGetTypeKind(base_type) != LLVMTypeKind::LLVMPointerTypeKind {
+                panic!("invalid base pointer type");
+            }
+
+            let gep_index = LLVMConstInt(LLVMInt32Type(), index as u64, 0);
+            let zero = LLVMConstInt(LLVMInt32Type(), 0, 0);
+
+            let result_type = LLVMGetElementType(base_type);
+
+            let module = LLVMGetGlobalParent(LLVMGetInsertBlock(self.builder) as LLVMValueRef);
+            let mut intrinsic_types = [result_type, base_type];
+            let fn_preserve_struct_access_index =
+                LLVMGetIntrinsicDeclaration(module, 266, intrinsic_types.as_mut_ptr(), 2);
+
+            let di_index = LLVMConstInt(LLVMInt32Type(), field_index as u64, 0);
+            let mut args = [base, gep_index, di_index];
+            let return_type = LLVMGetReturnType(LLVMTypeOf(fn_preserve_struct_access_index));
+            let fn_call = LLVMBuildCall2(
+                self.builder,
+                return_type,
+                fn_preserve_struct_access_index,
+                args.as_mut_ptr(),
+                3,
+                ptr::null(),
+            );
+
+            let type_attribute = LLVMCreateTypeAttribute(LLVMGetGlobalContext(), 75, el_ty);
+            LLVMAddCallSiteAttribute(fn_call, LLVMAttributeFunctionIndex, type_attribute);
+
+            // if !dbg_info.is_null() {
+            // }
+
+            fn_call
+        }
+    }
+
+    fn inject_preserve_struct_access_index(&mut self, gep: LLVMValueRef) {
+        unsafe {
+            let el_ty = LLVMGetElementType(LLVMGetElementType(LLVMTypeOf(gep)));
+            let base = LLVMGetOperand(gep, 0);
+            let index = LLVMConstIntGetZExtValue(LLVMGetOperand(gep, 1));
+            let field_index = 0;
+
+            let preserve_index_call = self.emit_preserve_struct_access_index(
+                el_ty,
+                base,
+                index as u32,
+                field_index,
+                ptr::null_mut(),
+            );
+        }
     }
 
     pub fn run(mut self, exported_symbols: &HashSet<Cow<'static, str>>) {
@@ -312,7 +409,7 @@ impl DISanitizer {
             );
         }
 
-        unsafe { LLVMDisposeDIBuilder(self.builder) };
+        unsafe { LLVMDisposeDIBuilder(self.di_builder) };
     }
 
     // Make it so that only exported symbols (programs marked as #[no_mangle]) get BTF
@@ -356,7 +453,7 @@ impl DISanitizer {
             // with linkage=static
             let mut new_program = unsafe {
                 let new_program = LLVMDIBuilderCreateFunction(
-                    self.builder,
+                    self.di_builder,
                     subprogram.scope().unwrap(),
                     name.as_ptr() as *const c_char,
                     name.len(),
@@ -374,7 +471,7 @@ impl DISanitizer {
                 // Technically this must be called as part of the builder API, but effectively does
                 // nothing because we don't add any variables through the builder API, instead we
                 // replace retained nodes manually below.
-                LLVMDIBuilderFinalizeSubprogram(self.builder, new_program);
+                LLVMDIBuilderFinalizeSubprogram(self.di_builder, new_program);
 
                 DISubprogram::from_value_ref(LLVMMetadataAsValue(self.context, new_program))
             };
@@ -413,12 +510,12 @@ impl DISanitizer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Item {
+enum Item<'ctx> {
     GlobalVariable(LLVMValueRef),
     GlobalAlias(LLVMValueRef),
     Function(LLVMValueRef),
     FunctionParam(LLVMValueRef),
-    Instruction(LLVMValueRef),
+    Instruction(Instruction<'ctx>),
     Operand(Operand),
     MetadataEntry(LLVMValueRef, u32, usize),
 }
@@ -443,16 +540,16 @@ impl Operand {
     }
 }
 
-impl Item {
+impl<'ctx> Item<'ctx> {
     fn value_ref(&self) -> LLVMValueRef {
         match self {
             Item::GlobalVariable(value)
             | Item::GlobalAlias(value)
             | Item::Function(value)
             | Item::FunctionParam(value)
-            | Item::Instruction(value)
             | Item::Operand(Operand { value, .. })
             | Item::MetadataEntry(value, _, _) => *value,
+            Item::Instruction(instruction) => instruction.value_ref(),
         }
     }
 

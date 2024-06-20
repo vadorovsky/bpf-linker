@@ -4,11 +4,12 @@ use std::{
     ptr::NonNull,
 };
 
+use clap::ValueEnum;
 use llvm_sys::{
     core::{
         LLVMCountParams, LLVMDisposeValueMetadataEntries, LLVMGetNumOperands, LLVMGetOperand,
-        LLVMGetParam, LLVMGlobalCopyAllMetadata, LLVMIsAFunction, LLVMIsAGlobalObject,
-        LLVMIsAInstruction, LLVMIsAMDNode, LLVMIsAUser, LLVMMDNodeInContext2,
+        LLVMGetParam, LLVMGlobalCopyAllMetadata, LLVMIsAFunction, LLVMIsAGetElementPtrInst,
+        LLVMIsAGlobalObject, LLVMIsAInstruction, LLVMIsAMDNode, LLVMIsAUser, LLVMMDNodeInContext2,
         LLVMMDStringInContext2, LLVMMetadataAsValue, LLVMPrintValueToString,
         LLVMReplaceMDNodeOperandWith, LLVMValueAsMetadata, LLVMValueMetadataEntriesGetKind,
         LLVMValueMetadataEntriesGetMetadata,
@@ -289,7 +290,7 @@ impl Drop for MetadataEntries {
     }
 }
 
-/// Represents a metadata node.
+/// Represents a function.
 #[derive(Clone)]
 pub struct Function<'ctx> {
     pub value_ref: LLVMValueRef,
@@ -335,5 +336,63 @@ impl<'ctx> Function<'ctx> {
 
     pub(crate) fn set_subprogram(&mut self, subprogram: &DISubprogram) {
         unsafe { LLVMSetSubprogram(self.value_ref, LLVMValueAsMetadata(subprogram.value_ref)) };
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Instruction<'ctx> {
+    GetElementPtrInst(GetElementPtrInst<'ctx>),
+    Other(LLVMValueRef),
+}
+
+impl<'ctx> Instruction<'ctx> {
+    pub fn new(value: LLVMValueRef) -> Self {
+        if unsafe { !LLVMIsAGetElementPtrInst(value).is_null() } {
+            let get_element_ptr_inst = unsafe { GetElementPtrInst::from_value_ref(value) };
+            return Instruction::GetElementPtrInst(get_element_ptr_inst);
+        }
+        Instruction::Other(value)
+    }
+
+    pub fn value_ref(&self) -> LLVMValueRef {
+        match self {
+            Self::GetElementPtrInst(get_element_ptr_inst) => get_element_ptr_inst.value_ref,
+            Self::Other(value_ref) => *value_ref,
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct GetElementPtrInst<'ctx> {
+    pub value_ref: LLVMValueRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> std::fmt::Debug for GetElementPtrInst<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value_str = Message {
+            ptr: unsafe { LLVMPrintValueToString(self.value_ref) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        f.debug_struct("GetElementPtrInst")
+            .field("value", &value_str)
+            .finish()
+    }
+}
+
+impl<'ctx> GetElementPtrInst<'ctx> {
+    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+        Self {
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
     }
 }
