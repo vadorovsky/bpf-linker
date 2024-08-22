@@ -1,32 +1,45 @@
 use std::{
     borrow::Cow,
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
-    ffi::c_char,
+    ffi::{c_char, CStr},
+    fmt::Debug,
     hash::Hasher,
     ptr,
 };
 
 use gimli::{DW_TAG_pointer_type, DW_TAG_structure_type, DW_TAG_variant_part};
-use llvm_sys::{core::*, debuginfo::*, prelude::*};
-use tracing::{span, trace, warn, Level};
+use llvm_sys::{core::*, debuginfo::*, prelude::*, LLVMAttributeFunctionIndex, LLVMTypeKind};
+use tracing::{debug, span, trace, warn, Level};
 
-use super::types::{
-    di::DIType,
-    ir::{Function, MDNode, Metadata, Value},
+use super::{
+    intrinsic::llvm_preserve_array_access_index_id,
+    types::{
+        di::DIType,
+        ir::{Function, IntToPtrInst, MDNode, Operands, Type, User, Value, ValueRef},
+    },
 };
-use crate::llvm::{iter::*, types::di::DISubprogram};
+use crate::llvm::{
+    intrinsic::llvm_preserve_struct_access_index_id,
+    iter::*,
+    types::{
+        di::{DISubprogram, DIVariable},
+        ir::{ConstantInt, Instruction, LoadInst, Metadata, MetadataEntries},
+    },
+    Message,
+};
 
 // KSYM_NAME_LEN from linux kernel intentionally set
 // to lower value found accross kernel versions to ensure
 // backward compatibility
 const MAX_KSYM_NAME_LEN: usize = 128;
 
-pub struct DISanitizer {
+pub struct DISanitizer<'ctx> {
     context: LLVMContextRef,
     module: LLVMModuleRef,
-    builder: LLVMDIBuilderRef,
+    builder: LLVMBuilderRef,
+    di_builder: LLVMDIBuilderRef,
     visited_nodes: HashSet<u64>,
-    item_stack: Vec<Item>,
+    item_stack: Vec<Item<'ctx>>,
     replace_operands: HashMap<u64, LLVMMetadataRef>,
     skipped_types: Vec<String>,
 }
@@ -59,12 +72,13 @@ fn sanitize_type_name<T: AsRef<str>>(name: T) -> String {
     n
 }
 
-impl DISanitizer {
-    pub fn new(context: LLVMContextRef, module: LLVMModuleRef) -> DISanitizer {
+impl<'ctx> DISanitizer<'ctx> {
+    pub fn new(context: LLVMContextRef, module: LLVMModuleRef) -> DISanitizer<'ctx> {
         DISanitizer {
             context,
             module,
-            builder: unsafe { LLVMCreateDIBuilder(module) },
+            builder: unsafe { LLVMCreateBuilderInContext(context) },
+            di_builder: unsafe { LLVMCreateDIBuilder(module) },
             visited_nodes: HashSet::new(),
             item_stack: Vec::new(),
             replace_operands: HashMap::new(),
@@ -217,7 +231,7 @@ impl DISanitizer {
     }
 
     // navigate the tree of LLVMValueRefs (DFS-pre-order)
-    fn visit_item(&mut self, mut item: Item) {
+    fn visit_item(&mut self, mut item: Item<'ctx>) {
         let value_ref = item.value_ref();
         let value_id = item.value_id();
 
@@ -243,6 +257,38 @@ impl DISanitizer {
             }
         }
 
+        if let Item::Instruction(inst) = item.clone() {
+            if let Instruction::LoadInst(load_inst) = inst {
+                debug!("LOAD FOUND: {load_inst:?}");
+                self.visit_load_inst(load_inst);
+            }
+            // if let Instruction::GetElementPtrInst(get_element_ptr_inst) = inst {
+            //     debug!("GEP FOUND: {get_element_ptr_inst:?}");
+
+            //     self.inject_preserve_struct_access_index(get_element_ptr_inst.value_ref());
+
+            //     let operands = value.operands();
+            //     if let Some(operands) = operands {
+            //         for (i, operand) in operands.enumerate() {
+            //             let operand = Value::new(operand);
+            //             debug!("GEP operand {i}: {:?}", operand);
+
+            //             let suboperands = operand.operands();
+            //             if let Some(suboperands) = suboperands {
+            //                 for (i, suboperand) in suboperands.enumerate() {
+            //                     let suboperand = Value::new(suboperand);
+            //                     debug!("GEP suboperand {i}: {:?}", suboperand);
+            //                 }
+            //             }
+            //         }
+            //     } else {
+            //         debug!("GEP has no operands");
+            //     }
+            // } else {
+            //     debug!("some other instruction");
+            // }
+        }
+
         let first_visit = self.visited_nodes.insert(value_id);
         if !first_visit {
             trace!("already visited");
@@ -251,7 +297,7 @@ impl DISanitizer {
 
         self.item_stack.push(item.clone());
 
-        if let Value::MDNode(mdnode) = value.clone() {
+        if let Value::Metadata(Metadata::MDNode(mdnode)) = value.clone() {
             self.visit_mdnode(mdnode)
         }
 
@@ -259,7 +305,7 @@ impl DISanitizer {
             for (index, operand) in operands.enumerate() {
                 self.visit_item(Item::Operand(Operand {
                     parent: value_ref,
-                    value: operand,
+                    value: operand.value_ref(),
                     index: index as u32,
                 }))
             }
@@ -274,19 +320,255 @@ impl DISanitizer {
 
         // If an item has sub items that are not operands nor metadata entries, we need to visit
         // those too.
-        if let Value::Function(fun) = value {
+        if let Value::User(User::Function(fun)) = value {
             for param in fun.params() {
                 self.visit_item(Item::FunctionParam(param));
             }
 
             for basic_block in fun.basic_blocks() {
                 for instruction in basic_block.instructions_iter() {
-                    self.visit_item(Item::Instruction(instruction));
+                    self.visit_item(Item::Instruction(Instruction::new(instruction)));
                 }
             }
         }
 
         let _ = self.item_stack.pop().unwrap();
+    }
+
+    fn visit_load_inst(&mut self, load_inst: LoadInst) {
+        let pointer_operand = load_inst.pointer_operand();
+        match pointer_operand {
+            // When `load` is used for accessing a subsequent struct field:
+            //
+            Value::User(User::Instruction(Instruction::GetElementPtrInst(get_element_ptr))) => {
+                debug!("GEP: {get_element_ptr:?}");
+
+                let source_element_type = get_element_ptr.source_element_type();
+                debug!("GEP SOURCE ELEMENT TYPE: {source_element_type:?}");
+
+                let gep_index = get_element_ptr.indices().next().unwrap();
+                if let Value::User(User::ConstantInt(ref constant_int)) = gep_index {
+                    debug!("GEP index: {gep_index:?}");
+                    let gep_index = constant_int.unsigned() as u32;
+                    debug!("GEP index: {gep_index:?}");
+
+                    let pointer_operand = get_element_ptr.pointer_operand();
+
+                    if let Value::User(User::Instruction(Instruction::IntToPtrInst(
+                        int_to_ptr_inst,
+                    ))) = pointer_operand
+                    {
+                        self.visit_int_to_ptr_inst(
+                            int_to_ptr_inst,
+                            // base.clone(),
+                            // base_type,
+                            // result_type,
+                            load_inst.clone(),
+                            source_element_type,
+                            gep_index,
+                        )
+                    }
+                }
+
+                // for (i, index) in get_element_ptr.indices().enumerate() {}
+
+                // let inst: Instruction = get_element_ptr.into();
+                // let operands = inst.operands();
+                // for (i, operand) in operands.enumerate() {
+                //     debug!("GEP operand {i}: {:?}", operand);
+
+                //     let suboperands = operand.operands();
+                //     if let Some(suboperands) = suboperands {
+                //         for (i, suboperand) in suboperands.enumerate() {
+                //             debug!("GEP suboperand {i}: {:?}", suboperand);
+                //         }
+                //     }
+                // }
+            }
+            // When `load is used for accessing the first struct field:
+            Value::User(User::Instruction(Instruction::IntToPtrInst(int_to_ptr_inst))) => {
+                let source_element_type = Type::int8(self.context);
+                debug!("NO GEP ELEMENT TYPE: {source_element_type:?}");
+                self.visit_int_to_ptr_inst(
+                    int_to_ptr_inst,
+                    load_inst.clone(),
+                    source_element_type,
+                    0,
+                )
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_int_to_ptr_inst(
+        &mut self,
+        int_to_ptr: IntToPtrInst,
+        load_inst: LoadInst,
+        source_element_type: Type,
+        // base: Value,
+        // base_type: Type,
+        // result_type: Type,
+        gep_index: u32,
+    ) {
+        let int_to_ptr: Instruction = int_to_ptr.into();
+        debug!("HAS_METADATA: {}", int_to_ptr.has_metadata());
+        let metadata = unsafe {
+            LLVMGetMetadata(
+                int_to_ptr.value_ref(),
+                LLVMMetadataKind::LLVMDILocalVariableMetadataKind as u32,
+            )
+        };
+        let metadata = Value::new(metadata);
+        debug!("METADATA: {metadata:?}");
+
+        debug!("PREV_INST: {int_to_ptr:?}");
+        let next_instruction = int_to_ptr.next_instruction();
+        debug!("NEXT_INST: {next_instruction:?}");
+
+        let mut emit_btf_reloc = false;
+
+        if let Instruction::DbgVariableIntrinsic(dbg_variable_intrinsic) = next_instruction {
+            debug!("found DbgVariable");
+            let variable = dbg_variable_intrinsic.variable();
+            let variable: DIVariable = variable.into();
+            let di_type = variable.di_type();
+            if let Metadata::DIDerivedType(di_derived_type) = di_type {
+                let base_type = di_derived_type.base_type();
+                if let Metadata::DICompositeType(di_composite_type) = base_type {
+                    if let Some(name) = di_composite_type.name() {
+                        debug!("NAME: {}", name.to_string_lossy());
+                    }
+                    for (i, field) in di_composite_type.elements().enumerate() {
+                        debug!("field {i}: {field:?}");
+                        if let Metadata::DIDerivedType(field) = field {
+                            if let Some(name) = field.name() {
+                                debug!("field name: {}", name.to_str().unwrap());
+                                if name.to_str().unwrap() == "_btf_marker" {
+                                    emit_btf_reloc = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if emit_btf_reloc {
+            debug!("EMIT BTF HERE!");
+            // self.emit_preserve_struct_access_index(gep_index);
+            // self.emit_preserve_array_access_index(base, base_type, result_type, 0, gep_index);
+            self.emit_preserve_array_access_index(load_inst, source_element_type, 0, gep_index);
+        }
+    }
+
+    fn emit_preserve_array_access_index(
+        &mut self,
+        load_inst: LoadInst,
+        source_element_type: Type,
+        // base: Value,
+        // base_type: Type,
+        // result_type: Type,
+        dimension: u32,
+        gep_index: u32,
+    ) {
+        let load_inst_value: Value = load_inst.clone().into();
+        debug!("load_inst: {load_inst:?}");
+        let load_inst_type = load_inst_value.get_type();
+        debug!("load_inst_type: {load_inst_type:?}");
+        let base = load_inst.pointer_operand();
+        debug!("base: {base:?}");
+        let base_type = base.get_type();
+        let result_type = load_inst_value.get_type();
+        debug!("base_type: {base_type:?}");
+        debug!("result_type: {result_type:?}");
+
+        debug!("dimension: {dimension}");
+        debug!("gep_index: {gep_index}");
+
+        // let dimension = unsafe { LLVMConstInt(LLVMInt32Type(), dimension as u64, 0) };
+        // let gep_index = unsafe { LLVMConstInt(LLVMInt32Type(), gep_index as u64, 0) };
+        let dimension = ConstantInt::new_32(dimension);
+        let gep_index = ConstantInt::new_32(gep_index);
+
+        let intrinsic_id = llvm_preserve_array_access_index_id();
+        debug!("intrinsic_id: {intrinsic_id}");
+
+        let fn_preserve_array_access_index =
+            Function::intrinsic_declaration(self.module, intrinsic_id, &[result_type, base_type]);
+        // let fn_preserve_array_access_index = unsafe {
+        //     LLVMGetIntrinsicDeclaration(self.module, intrinsic_id, intrinsic_types.as_mut_ptr(), 2)
+        // };
+        debug!("emitted intrinsic");
+
+        let fn_type = fn_preserve_array_access_index.function_type();
+        debug!("foo 1");
+
+        let param_types_count = unsafe { LLVMCountParamTypes(fn_type.type_ref) } as usize;
+        debug!("foo 2");
+
+        // let mut param_types: Vec<LLVMTypeRef> = Vec::with_capacity(param_types_count);
+        let mut param_types: Vec<LLVMTypeRef> = vec![std::ptr::null_mut(); param_types_count];
+        debug!("foo 3");
+        unsafe { LLVMGetParamTypes(fn_type.type_ref, param_types.as_mut_ptr()) };
+        debug!("foo 4");
+        debug!("param_types len: {}", param_types.len());
+
+        for i in 0..param_types_count {
+            debug!("param: {i}: {:?}", param_types[i]);
+            let param_type = unsafe { Type::from_type_ref(param_types[i]) };
+            debug!("param (wrapper): {i}: {param_type:?}");
+        }
+
+        let mut args: [LLVMValueRef; 3] = [
+            base.value_ref(),
+            // load_inst.value_ref(),
+            dimension.value_ref(),
+            // gep_index.value_ref(),
+            base.value_ref(),
+            // std::ptr::null_mut(),
+        ];
+        // let mut args: Vec<LLVMValueRef> = vec![
+        //     base.value_ref(),
+        //     dimension.value_ref(),
+        //     gep_index.value_ref(),
+        // ];
+        // let mut args: Vec<LLVMValueRef> = vec![load_inst.value_ref(), dimension, gep_index];
+
+        for i in 0..3 {
+            let val = Value::new(args[i]);
+            debug!("arg: {i}: {val:?}");
+            let type_ref = unsafe { LLVMTypeOf(args[i]) };
+            let ty = unsafe { Type::from_type_ref(type_ref) };
+            debug!("arg: {i}: type: {ty:?}");
+        }
+
+        // let mut args: Vec<LLVMValueRef> = vec![load_inst.value_ref(), dimension, gep_index];
+        let name = c"";
+        let call_inst = unsafe {
+            LLVMBuildCall2(
+                self.builder,
+                fn_type.type_ref,
+                fn_preserve_array_access_index.value_ref,
+                args.as_mut_ptr(),
+                3,
+                name.as_ptr(),
+            )
+        };
+
+        // let type_attribute = unsafe { LLVMCreateTypeAttribute(LLVMGetGlobalContext(), 75, el_ty) };
+        // unsafe { LLVMAddCallSiteAttribute(call_inst, LLVMAttributeFunctionIndex, type_attribute) };
+
+        debug!("emitted intrinsic call");
+    }
+
+    fn emit_preserve_struct_access_index(&mut self, gep_index: u64) {
+        let intrinsic_id = llvm_preserve_struct_access_index_id();
+        debug!("intrinsic_id: {intrinsic_id}");
+
+        // let mut intrinsic_types: Vec<LLVMTypeRef> = vec![];
+        // let fn_preserve_struct_access_index = unsafe {
+        //     LLVMGetIntrinsicDeclaration(self.module, intrinsic_id, intrinsic_types.as_mut_ptr(), 0)
+        // };
     }
 
     pub fn run(mut self, exported_symbols: &HashSet<Cow<'static, str>>) {
@@ -312,7 +594,7 @@ impl DISanitizer {
             );
         }
 
-        unsafe { LLVMDisposeDIBuilder(self.builder) };
+        unsafe { LLVMDisposeDIBuilder(self.di_builder) };
     }
 
     // Make it so that only exported symbols (programs marked as #[no_mangle]) get BTF
@@ -356,7 +638,7 @@ impl DISanitizer {
             // with linkage=static
             let mut new_program = unsafe {
                 let new_program = LLVMDIBuilderCreateFunction(
-                    self.builder,
+                    self.di_builder,
                     subprogram.scope().unwrap(),
                     name.as_ptr() as *const c_char,
                     name.len(),
@@ -374,7 +656,7 @@ impl DISanitizer {
                 // Technically this must be called as part of the builder API, but effectively does
                 // nothing because we don't add any variables through the builder API, instead we
                 // replace retained nodes manually below.
-                LLVMDIBuilderFinalizeSubprogram(self.builder, new_program);
+                LLVMDIBuilderFinalizeSubprogram(self.di_builder, new_program);
 
                 DISubprogram::from_value_ref(LLVMMetadataAsValue(self.context, new_program))
             };
@@ -413,12 +695,12 @@ impl DISanitizer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Item {
+enum Item<'ctx> {
     GlobalVariable(LLVMValueRef),
     GlobalAlias(LLVMValueRef),
     Function(LLVMValueRef),
     FunctionParam(LLVMValueRef),
-    Instruction(LLVMValueRef),
+    Instruction(Instruction<'ctx>),
     Operand(Operand),
     MetadataEntry(LLVMValueRef, u32, usize),
 }
@@ -443,16 +725,16 @@ impl Operand {
     }
 }
 
-impl Item {
+impl<'ctx> Item<'ctx> {
     fn value_ref(&self) -> LLVMValueRef {
         match self {
             Item::GlobalVariable(value)
             | Item::GlobalAlias(value)
             | Item::Function(value)
             | Item::FunctionParam(value)
-            | Item::Instruction(value)
             | Item::Operand(Operand { value, .. })
             | Item::MetadataEntry(value, _, _) => *value,
+            Item::Instruction(instruction) => instruction.value_ref(),
         }
     }
 

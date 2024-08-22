@@ -1,21 +1,28 @@
 use std::{
     ffi::{CString, NulError},
+    fmt::Debug,
+    iter::Skip,
     marker::PhantomData,
     ptr::NonNull,
 };
 
 use llvm_sys::{
     core::{
-        LLVMCountParams, LLVMDisposeValueMetadataEntries, LLVMGetNumOperands, LLVMGetOperand,
-        LLVMGetParam, LLVMGlobalCopyAllMetadata, LLVMIsAFunction, LLVMIsAGlobalObject,
-        LLVMIsAInstruction, LLVMIsAMDNode, LLVMIsAUser, LLVMMDNodeInContext2,
-        LLVMMDStringInContext2, LLVMMetadataAsValue, LLVMPrintValueToString,
-        LLVMReplaceMDNodeOperandWith, LLVMValueAsMetadata, LLVMValueMetadataEntriesGetKind,
-        LLVMValueMetadataEntriesGetMetadata,
+        LLVMConstInt, LLVMConstIntGetZExtValue, LLVMCountParams, LLVMDisposeValueMetadataEntries,
+        LLVMGetGEPSourceElementType, LLVMGetIntrinsicDeclaration, LLVMGetNextInstruction,
+        LLVMGetNumOperands, LLVMGetOperand, LLVMGetParam, LLVMGlobalCopyAllMetadata,
+        LLVMGlobalGetValueType, LLVMHasMetadata, LLVMInt32Type, LLVMInt8TypeInContext,
+        LLVMIsAConstantInt, LLVMIsADbgVariableIntrinsic, LLVMIsAFunction, LLVMIsAGetElementPtrInst,
+        LLVMIsAGlobalObject, LLVMIsAInstruction, LLVMIsAIntToPtrInst, LLVMIsALoadInst,
+        LLVMIsAMDNode, LLVMIsAUser, LLVMMDNodeInContext2, LLVMMDStringInContext2,
+        LLVMMetadataAsValue, LLVMPrintTypeToString, LLVMPrintValueToString,
+        LLVMReplaceMDNodeOperandWith, LLVMTypeOf, LLVMValueAsMetadata,
+        LLVMValueMetadataEntriesGetKind, LLVMValueMetadataEntriesGetMetadata,
     },
     debuginfo::{LLVMGetMetadataKind, LLVMGetSubprogram, LLVMMetadataKind, LLVMSetSubprogram},
     prelude::{
-        LLVMBasicBlockRef, LLVMContextRef, LLVMMetadataRef, LLVMValueMetadataEntry, LLVMValueRef,
+        LLVMBasicBlockRef, LLVMContextRef, LLVMMetadataRef, LLVMModuleRef, LLVMTypeRef,
+        LLVMValueMetadataEntry, LLVMValueRef,
     },
 };
 
@@ -25,6 +32,8 @@ use crate::llvm::{
     types::di::{DICompositeType, DIDerivedType, DISubprogram, DIType},
     Message,
 };
+
+use super::di::DILocalVariable;
 
 pub(crate) fn replace_name(
     value_ref: LLVMValueRef,
@@ -38,38 +47,123 @@ pub(crate) fn replace_name(
     Ok(())
 }
 
+pub trait ValueRef {
+    fn value_ref(&self) -> LLVMValueRef;
+}
+
+pub struct OperandsIterator<'ctx> {
+    curr: u32,
+    limit: u32,
+    value_ref: LLVMValueRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> Iterator for OperandsIterator<'ctx> {
+    type Item = Value<'ctx>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.curr < self.limit {
+            let res = unsafe { Some(Value::new(LLVMGetOperand(self.value_ref, self.curr))) };
+            self.curr += 1;
+            res
+        } else {
+            None
+        }
+    }
+}
+
+impl<'ctx> OperandsIterator<'ctx> {
+    pub(super) fn new(value_ref: LLVMValueRef) -> Self {
+        let limit = unsafe { LLVMGetNumOperands(value_ref) as u32 };
+        Self {
+            curr: 0,
+            limit,
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub(super) fn new_from(value_ref: LLVMValueRef, start: u32) -> Self {
+        let limit = unsafe { LLVMGetNumOperands(value_ref) as u32 };
+        Self {
+            curr: start,
+            limit,
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
+}
+
+pub trait Operands: ValueRef {
+    fn operands(&self) -> OperandsIterator {
+        OperandsIterator::new(self.value_ref())
+    }
+}
+
 #[derive(Clone)]
 pub enum Value<'ctx> {
-    MDNode(MDNode<'ctx>),
-    Function(Function<'ctx>),
+    Metadata(Metadata<'ctx>),
+    User(User<'ctx>),
     Other(LLVMValueRef),
+}
+
+impl<'ctx> From<Instruction<'ctx>> for Value<'ctx> {
+    fn from(value: Instruction<'ctx>) -> Self {
+        Self::User(User::Instruction(value))
+    }
+}
+
+impl<'ctx> From<GetElementPtrInst<'ctx>> for Value<'ctx> {
+    fn from(value: GetElementPtrInst<'ctx>) -> Self {
+        Self::User(User::Instruction(Instruction::GetElementPtrInst(value)))
+    }
+}
+
+impl<'ctx> From<LoadInst<'ctx>> for Value<'ctx> {
+    fn from(value: LoadInst<'ctx>) -> Self {
+        Self::User(User::Instruction(Instruction::LoadInst(value)))
+    }
 }
 
 impl<'ctx> std::fmt::Debug for Value<'ctx> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let value_to_string = |value| {
-            Message {
-                ptr: unsafe { LLVMPrintValueToString(value) },
-            }
-            .as_c_str()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string()
-        };
+        let value = self.value_ref();
+        let value_string = Message {
+            ptr: unsafe { LLVMPrintValueToString(value) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
         match self {
-            Self::MDNode(node) => f
-                .debug_struct("MDNode")
-                .field("value", &value_to_string(node.value_ref))
+            Self::Metadata(metadata) => Metadata::fmt(metadata, f),
+            Self::User(User::ConstantInt(_)) => f
+                .debug_struct("ConstantInt")
+                .field("value", &value_string)
                 .finish(),
-            Self::Function(fun) => f
+            Self::User(User::Function(_)) => f
                 .debug_struct("Function")
-                .field("value", &value_to_string(fun.value_ref))
+                .field("value", &value_string)
                 .finish(),
-            Self::Other(value) => f
+            Self::User(User::Instruction(_)) => f
+                .debug_struct("Instruction")
+                .field("value", &value_string)
+                .finish(),
+            Self::Other(_) => f
                 .debug_struct("Other")
-                .field("value", &value_to_string(*value))
+                .field("value", &value_string)
                 .finish(),
+        }
+    }
+}
+
+impl<'ctx> ValueRef for Value<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        match self {
+            Self::Metadata(metadata) => metadata.value_ref(),
+            Self::User(user) => user.value_ref(),
+            Self::Other(value) => *value,
         }
     }
 }
@@ -78,41 +172,85 @@ impl<'ctx> Value<'ctx> {
     pub fn new(value: LLVMValueRef) -> Self {
         if unsafe { !LLVMIsAMDNode(value).is_null() } {
             let mdnode = unsafe { MDNode::from_value_ref(value) };
-            return Value::MDNode(mdnode);
+            return Value::Metadata(Metadata::MDNode(mdnode));
+        } else if unsafe { !LLVMIsAConstantInt(value).is_null() } {
+            let constant_int = unsafe { ConstantInt::from_value_ref(value) };
+            return Value::User(User::ConstantInt(constant_int));
         } else if unsafe { !LLVMIsAFunction(value).is_null() } {
-            return Value::Function(unsafe { Function::from_value_ref(value) });
+            return Value::User(User::Function(unsafe { Function::from_value_ref(value) }));
+        } else if unsafe { !LLVMIsAInstruction(value).is_null() } {
+            let inst = Instruction::new(value);
+            return Value::User(User::Instruction(inst));
         }
         Value::Other(value)
     }
 
     pub fn metadata_entries(&self) -> Option<MetadataEntries> {
-        let value = match self {
-            Value::MDNode(node) => node.value_ref,
-            Value::Function(f) => f.value_ref,
-            Value::Other(value) => *value,
-        };
+        let value = self.value_ref();
         MetadataEntries::new(value)
     }
 
-    pub fn operands(&self) -> Option<impl Iterator<Item = LLVMValueRef>> {
-        let value = match self {
-            Value::MDNode(node) => Some(node.value_ref),
-            Value::Function(f) => Some(f.value_ref),
-            Value::Other(value) if unsafe { !LLVMIsAUser(*value).is_null() } => Some(*value),
+    pub fn operands(&self) -> Option<impl Iterator<Item = Value>> {
+        match self {
+            Value::Metadata(metadata) => Some(metadata.operands()),
+            Value::User(user) => Some(user.operands()),
             _ => None,
-        };
+        }
+    }
 
-        value.map(|value| unsafe {
-            (0..LLVMGetNumOperands(value)).map(move |i| LLVMGetOperand(value, i as u32))
-        })
+    pub fn get_type(&self) -> Type<'_> {
+        unsafe {
+            let type_ref = LLVMTypeOf(self.value_ref());
+            Type::from_type_ref(type_ref)
+        }
     }
 }
 
+#[derive(Clone)]
 pub enum Metadata<'ctx> {
-    DICompositeType(DICompositeType<'ctx>),
+    MDNode(MDNode<'ctx>),
     DIDerivedType(DIDerivedType<'ctx>),
+    DICompositeType(DICompositeType<'ctx>),
     DISubprogram(DISubprogram<'ctx>),
-    Other(#[allow(dead_code)] LLVMValueRef),
+    Other(LLVMValueRef),
+}
+
+impl<'ctx> std::fmt::Debug for Metadata<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = self.value_ref();
+        let value_string = Message {
+            ptr: unsafe { LLVMPrintValueToString(value) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        let struct_name = match self {
+            Self::MDNode(_) => "MDNode",
+            Self::DIDerivedType(_) => "DIDerivedType",
+            Self::DICompositeType(_) => "DICompositeType",
+            Self::DISubprogram(_) => "DISubprogram",
+            Self::Other(_) => "Other",
+        };
+        f.debug_struct(struct_name)
+            .field("value", &value_string)
+            .finish()
+    }
+}
+
+impl<'ctx> Operands for Metadata<'ctx> {}
+
+impl<'ctx> ValueRef for Metadata<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        match self {
+            Self::MDNode(mdnode) => mdnode.value_ref(),
+            Self::DIDerivedType(di_derived_type) => di_derived_type.value_ref(),
+            Self::DICompositeType(di_composite_type) => di_composite_type.value_ref(),
+            Self::DISubprogram(di_subprogram) => di_subprogram.value_ref(),
+            Self::Other(value) => *value,
+        }
+    }
 }
 
 impl<'ctx> Metadata<'ctx> {
@@ -186,11 +324,33 @@ impl<'ctx> TryFrom<MDNode<'ctx>> for Metadata<'ctx> {
     }
 }
 
+impl<'ctx> TryFrom<DIType<'ctx>> for Metadata<'ctx> {
+    type Error = ();
+
+    fn try_from(value: DIType<'ctx>) -> Result<Self, Self::Error> {
+        Ok(unsafe { Self::from_value_ref(value.value_ref) })
+    }
+}
+
+impl<'ctx> TryFrom<DIDerivedType<'ctx>> for Metadata<'ctx> {
+    type Error = ();
+
+    fn try_from(value: DIDerivedType<'ctx>) -> Result<Self, Self::Error> {
+        Ok(unsafe { Self::from_value_ref(value.value_ref()) })
+    }
+}
+
 /// Represents a metadata node.
 #[derive(Clone)]
 pub struct MDNode<'ctx> {
     pub(super) value_ref: LLVMValueRef,
     _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> ValueRef for MDNode<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
 }
 
 impl<'ctx> MDNode<'ctx> {
@@ -252,8 +412,8 @@ impl<'ctx> MDNode<'ctx> {
 }
 
 pub struct MetadataEntries {
-    entries: *mut LLVMValueMetadataEntry,
-    count: usize,
+    pub entries: *mut LLVMValueMetadataEntry,
+    pub count: usize,
 }
 
 impl MetadataEntries {
@@ -289,11 +449,73 @@ impl Drop for MetadataEntries {
     }
 }
 
-/// Represents a metadata node.
+#[derive(Clone)]
+pub enum User<'ctx> {
+    ConstantInt(ConstantInt<'ctx>),
+    Function(Function<'ctx>),
+    Instruction(Instruction<'ctx>),
+}
+
+impl<'ctx> Operands for User<'ctx> {}
+
+impl<'ctx> ValueRef for User<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        match self {
+            Self::ConstantInt(constant_int) => constant_int.value_ref(),
+            Self::Function(f) => f.value_ref(),
+            Self::Instruction(inst) => inst.value_ref(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConstantInt<'ctx> {
+    pub value_ref: LLVMValueRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> Operands for ConstantInt<'ctx> {}
+
+impl<'ctx> ValueRef for ConstantInt<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
+}
+
+impl<'ctx> ConstantInt<'ctx> {
+    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+        Self {
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn new_32(value: u32) -> Self {
+        unsafe {
+            let value_ref = LLVMConstInt(LLVMInt32Type(), value as u64, 0);
+            Self::from_value_ref(value_ref)
+        }
+    }
+
+    /// Returns the constant as a `u64`.
+    pub fn unsigned(&self) -> u64 {
+        unsafe { LLVMConstIntGetZExtValue(self.value_ref) }
+    }
+}
+
+/// Represents a function.
 #[derive(Clone)]
 pub struct Function<'ctx> {
     pub value_ref: LLVMValueRef,
     _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> Operands for Function<'ctx> {}
+
+impl<'ctx> ValueRef for Function<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
 }
 
 impl<'ctx> Function<'ctx> {
@@ -309,6 +531,20 @@ impl<'ctx> Function<'ctx> {
         Self {
             value_ref,
             _marker: PhantomData,
+        }
+    }
+
+    pub fn intrinsic_declaration(module: LLVMModuleRef, id: u32, param_types: &[Type]) -> Self {
+        let mut param_types: Vec<LLVMTypeRef> =
+            param_types.into_iter().map(|t| t.type_ref).collect();
+        unsafe {
+            let value_ref = LLVMGetIntrinsicDeclaration(
+                module,
+                id,
+                param_types.as_mut_ptr(),
+                param_types.len(),
+            );
+            Self::from_value_ref(value_ref)
         }
     }
 
@@ -335,5 +571,333 @@ impl<'ctx> Function<'ctx> {
 
     pub(crate) fn set_subprogram(&mut self, subprogram: &DISubprogram) {
         unsafe { LLVMSetSubprogram(self.value_ref, LLVMValueAsMetadata(subprogram.value_ref)) };
+    }
+
+    pub fn function_type(&self) -> Type {
+        unsafe {
+            let type_ref = LLVMGlobalGetValueType(self.value_ref());
+            Type::from_type_ref(type_ref)
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum Instruction<'ctx> {
+    DbgVariableIntrinsic(DbgVariableIntrinsic<'ctx>),
+    GetElementPtrInst(GetElementPtrInst<'ctx>),
+    IntToPtrInst(IntToPtrInst<'ctx>),
+    LoadInst(LoadInst<'ctx>),
+    Other(LLVMValueRef),
+}
+
+impl<'ctx> Instruction<'ctx> {
+    pub fn new(value: LLVMValueRef) -> Self {
+        if unsafe { !LLVMIsADbgVariableIntrinsic(value).is_null() } {
+            let dbg_variable_intrinsic = unsafe { DbgVariableIntrinsic::from_value_ref(value) };
+            return Instruction::DbgVariableIntrinsic(dbg_variable_intrinsic);
+        }
+        if unsafe { !LLVMIsAGetElementPtrInst(value).is_null() } {
+            let get_element_ptr_inst = unsafe { GetElementPtrInst::from_value_ref(value) };
+            return Instruction::GetElementPtrInst(get_element_ptr_inst);
+        }
+        if unsafe { !LLVMIsAIntToPtrInst(value).is_null() } {
+            let int_to_ptr_inst = unsafe { IntToPtrInst::from_value_ref(value) };
+            return Instruction::IntToPtrInst(int_to_ptr_inst);
+        }
+        if unsafe { !LLVMIsALoadInst(value).is_null() } {
+            let load_inst = unsafe { LoadInst::from_value_ref(value) };
+            return Instruction::LoadInst(load_inst);
+        }
+        Instruction::Other(value)
+    }
+
+    pub fn has_metadata(&self) -> bool {
+        unsafe { LLVMHasMetadata(self.value_ref()) > 0 }
+    }
+
+    pub fn next_instruction(&self) -> Self {
+        let value = unsafe { LLVMGetNextInstruction(self.value_ref()) };
+        Self::new(value)
+    }
+}
+
+impl<'ctx> From<IntToPtrInst<'ctx>> for Instruction<'ctx> {
+    fn from(value: IntToPtrInst<'ctx>) -> Self {
+        Self::IntToPtrInst(value)
+    }
+}
+
+impl<'ctx> From<GetElementPtrInst<'ctx>> for Instruction<'ctx> {
+    fn from(value: GetElementPtrInst<'ctx>) -> Self {
+        Self::GetElementPtrInst(value)
+    }
+}
+
+impl<'ctx> std::fmt::Debug for Instruction<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value_s = Message {
+            ptr: unsafe { LLVMPrintValueToString(self.value_ref()) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        match self {
+            Self::DbgVariableIntrinsic(_) => f
+                .debug_struct("DbgVariableIntrinsic")
+                .field("value", &value_s)
+                .finish(),
+            Self::GetElementPtrInst(_) => {
+                f.debug_struct("Function").field("value", &value_s).finish()
+            }
+            Self::IntToPtrInst(_) => f
+                .debug_struct("IntToPtrInst")
+                .field("value", &value_s)
+                .finish(),
+            Self::LoadInst(_) => f.debug_struct("LoadInst").field("value", &value_s).finish(),
+            Self::Other(_) => f.debug_struct("Other").field("value", &value_s).finish(),
+        }
+    }
+}
+
+impl<'ctx> Operands for Instruction<'ctx> {}
+
+impl<'ctx> ValueRef for Instruction<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        match self {
+            Self::DbgVariableIntrinsic(dbg_variable_intrinsic) => dbg_variable_intrinsic.value_ref,
+            Self::GetElementPtrInst(get_element_ptr_inst) => get_element_ptr_inst.value_ref,
+            Self::IntToPtrInst(int_to_ptr_inst) => int_to_ptr_inst.value_ref,
+            Self::LoadInst(load_inst) => load_inst.value_ref,
+            Self::Other(value_ref) => *value_ref,
+        }
+    }
+}
+
+#[repr(u32)]
+enum DbgVariableIntrinsicOperand {
+    Variable = 1,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct DbgVariableIntrinsic<'ctx> {
+    pub value_ref: LLVMValueRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> std::fmt::Debug for DbgVariableIntrinsic<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value_str = Message {
+            ptr: unsafe { LLVMPrintValueToString(self.value_ref) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        f.debug_struct("DbgValueInst")
+            .field("value", &value_str)
+            .finish()
+    }
+}
+
+impl<'ctx> DbgVariableIntrinsic<'ctx> {
+    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+        Self {
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
+
+    pub fn variable(&self) -> DILocalVariable<'_> {
+        let value_ref =
+            unsafe { LLVMGetOperand(self.value_ref, DbgVariableIntrinsicOperand::Variable as u32) };
+        unsafe { DILocalVariable::from_value_ref(value_ref) }
+    }
+}
+
+#[repr(u32)]
+enum GetElementPtrInstOperand {
+    Pointer = 0,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct GetElementPtrInst<'ctx> {
+    pub value_ref: LLVMValueRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> std::fmt::Debug for GetElementPtrInst<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value_str = Message {
+            ptr: unsafe { LLVMPrintValueToString(self.value_ref) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        f.debug_struct("GetElementPtrInst")
+            .field("value", &value_str)
+            .finish()
+    }
+}
+
+impl<'ctx> Operands for GetElementPtrInst<'ctx> {}
+
+impl<'ctx> ValueRef for GetElementPtrInst<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
+}
+
+impl<'ctx> GetElementPtrInst<'ctx> {
+    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+        Self {
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn indices(&self) -> OperandsIterator {
+        OperandsIterator::new_from(self.value_ref(), 1)
+    }
+
+    pub fn pointer_operand(&self) -> Value {
+        let operand =
+            unsafe { LLVMGetOperand(self.value_ref, GetElementPtrInstOperand::Pointer as u32) };
+        Value::new(operand)
+    }
+
+    pub fn source_element_type(&self) -> Type {
+        unsafe {
+            let type_ref = LLVMGetGEPSourceElementType(self.value_ref());
+            Type::from_type_ref(type_ref)
+        }
+    }
+
+    pub fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct IntToPtrInst<'ctx> {
+    pub value_ref: LLVMValueRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> std::fmt::Debug for IntToPtrInst<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value_str = Message {
+            ptr: unsafe { LLVMPrintValueToString(self.value_ref) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        f.debug_struct("IntToPtrInst")
+            .field("value", &value_str)
+            .finish()
+    }
+}
+
+impl<'ctx> IntToPtrInst<'ctx> {
+    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+        Self {
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
+}
+
+#[repr(u32)]
+enum LoadInstOperand {
+    Pointer = 0,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct LoadInst<'ctx> {
+    pub value_ref: LLVMValueRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> std::fmt::Debug for LoadInst<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value_str = Message {
+            ptr: unsafe { LLVMPrintValueToString(self.value_ref) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        f.debug_struct("LoadInst")
+            .field("value", &value_str)
+            .finish()
+    }
+}
+
+impl<'ctx> LoadInst<'ctx> {
+    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+        Self {
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn pointer_operand(&self) -> Value {
+        let operand = unsafe { LLVMGetOperand(self.value_ref, LoadInstOperand::Pointer as u32) };
+        Value::new(operand)
+    }
+
+    pub fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct Type<'ctx> {
+    pub type_ref: LLVMTypeRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> std::fmt::Debug for Type<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let type_string = Message {
+            ptr: unsafe { LLVMPrintTypeToString(self.type_ref) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        f.debug_struct("Type").field("type", &type_string).finish()
+    }
+}
+
+impl<'ctx> Type<'ctx> {
+    pub(crate) unsafe fn from_type_ref(type_ref: LLVMTypeRef) -> Self {
+        Self {
+            type_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn int8(context: LLVMContextRef) -> Self {
+        unsafe {
+            let type_ref = LLVMInt8TypeInContext(context);
+            Type::from_type_ref(type_ref)
+        }
     }
 }

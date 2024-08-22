@@ -1,4 +1,5 @@
 mod di;
+mod intrinsic;
 mod iter;
 mod types;
 

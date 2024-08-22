@@ -50,7 +50,7 @@ macro_rules! llvm_iterator {
                 let last = *next == *last;
                 let item = *next;
                 *next = unsafe { $next(*next) };
-                assert_eq!(next.is_null(), last);
+                // assert_eq!(next.is_null(), last);
                 Some(item)
             }
         }

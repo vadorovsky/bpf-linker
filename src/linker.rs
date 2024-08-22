@@ -509,6 +509,7 @@ impl Linker {
     fn llvm_init(&mut self) {
         let mut args = Vec::<Cow<str>>::new();
         args.push("bpf-linker".into());
+        args.push("-debug".into());
         // Disable cold call site detection. Many accessors in aya-ebpf return Result<T, E>
         // where the layout is larger than 64 bits, but the LLVM BPF target only supports
         // up to 64 bits return values. Since the accessors are tiny in terms of code, we

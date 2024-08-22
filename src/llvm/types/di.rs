@@ -16,10 +16,9 @@ use llvm_sys::{
     prelude::{LLVMContextRef, LLVMMetadataRef, LLVMValueRef},
 };
 
-use crate::llvm::{
-    mdstring_to_str,
-    types::ir::{MDNode, Metadata},
-};
+use crate::llvm::{mdstring_to_str, types::ir::MDNode};
+
+use super::ir::{Metadata, ValueRef};
 
 /// Returns a DWARF tag for the given debug info node.
 ///
@@ -34,6 +33,59 @@ use crate::llvm::{
 /// doesn't perform any validation checks.
 unsafe fn di_node_tag(metadata_ref: LLVMMetadataRef) -> DwTag {
     DwTag(LLVMGetDINodeTag(metadata_ref))
+}
+
+#[repr(u32)]
+enum DIVariableOperand {
+    Type = 3,
+}
+
+pub struct DIVariable<'ctx> {
+    pub(super) metadata_ref: LLVMMetadataRef,
+    pub(super) value_ref: LLVMValueRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> DIVariable<'ctx> {
+    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+        let metadata_ref = unsafe { LLVMValueAsMetadata(value_ref) };
+        Self {
+            metadata_ref,
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn di_type(&self) -> Metadata<'ctx> {
+        unsafe {
+            let value_ref = LLVMGetOperand(self.value_ref, DIVariableOperand::Type as u32);
+            Metadata::from_value_ref(value_ref)
+        }
+    }
+}
+
+impl<'ctx> From<DILocalVariable<'ctx>> for DIVariable<'ctx> {
+    fn from(local_variable: DILocalVariable<'ctx>) -> Self {
+        unsafe { Self::from_value_ref(local_variable.value_ref) }
+    }
+}
+
+/// Represents a local variable in debug information.
+pub struct DILocalVariable<'ctx> {
+    pub(super) metadata_ref: LLVMMetadataRef,
+    pub(super) value_ref: LLVMValueRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> DILocalVariable<'ctx> {
+    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+        let metadata_ref = unsafe { LLVMValueAsMetadata(value_ref) };
+        Self {
+            metadata_ref,
+            value_ref,
+            _marker: PhantomData,
+        }
+    }
 }
 
 /// Represents a source code file in debug infomation.
@@ -132,6 +184,11 @@ impl<'ctx> DIType<'ctx> {
         }
     }
 
+    /// Returns the name of the composite type.
+    pub fn name(&self) -> Option<&CStr> {
+        unsafe { di_type_name(self.metadata_ref) }
+    }
+
     /// Returns the offset of the type in bits. This offset is used in case the
     /// type is a member of a composite type.
     pub fn offset_in_bits(&self) -> usize {
@@ -159,10 +216,17 @@ enum DIDerivedTypeOperand {
 /// The types derived from other types usually add a level of indirection or an
 /// alternative name. The examples of derived types are pointers, references,
 /// typedefs, etc.
+#[derive(Clone)]
 pub struct DIDerivedType<'ctx> {
     metadata_ref: LLVMMetadataRef,
     value_ref: LLVMValueRef,
     _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> ValueRef for DIDerivedType<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
 }
 
 impl<'ctx> DIDerivedType<'ctx> {
@@ -189,6 +253,11 @@ impl<'ctx> DIDerivedType<'ctx> {
             let value = LLVMGetOperand(self.value_ref, DIDerivedTypeOperand::BaseType as u32);
             Metadata::from_value_ref(value)
         }
+    }
+
+    /// Returns the name of the derived type.
+    pub fn name(&self) -> Option<&CStr> {
+        unsafe { di_type_name(self.metadata_ref) }
     }
 
     /// Replaces the name of the type with a new name.
@@ -220,10 +289,17 @@ enum DICompositeTypeOperand {
 ///
 /// Composite type is a kind of type that can include other types, such as
 /// structures, enums, unions, etc.
+#[derive(Clone)]
 pub struct DICompositeType<'ctx> {
     metadata_ref: LLVMMetadataRef,
     value_ref: LLVMValueRef,
     _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> ValueRef for DICompositeType<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
 }
 
 impl<'ctx> DICompositeType<'ctx> {
@@ -323,9 +399,16 @@ enum DISubprogramOperand {
 }
 
 /// Represents the debug information for a subprogram (function) in LLVM IR.
+#[derive(Clone)]
 pub struct DISubprogram<'ctx> {
     pub value_ref: LLVMValueRef,
     _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> ValueRef for DISubprogram<'ctx> {
+    fn value_ref(&self) -> LLVMValueRef {
+        self.value_ref
+    }
 }
 
 impl<'ctx> DISubprogram<'ctx> {
