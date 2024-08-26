@@ -25,7 +25,7 @@ use llvm_sys::{
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use crate::llvm;
+use crate::llvm::{self, LLVMTypeError, Module};
 
 /// Linker error
 #[derive(Debug, Error)]
@@ -77,6 +77,10 @@ pub enum LinkerError {
     /// The input object file does not have embedded bitcode.
     #[error("no bitcode section found in {0}")]
     MissingBitcodeSection(PathBuf),
+
+    /// Instantiating of an LLVM type failed.
+    #[error(transparent)]
+    LLVMType(#[from] LLVMTypeError),
 }
 
 /// BPF Cpu type
@@ -224,15 +228,15 @@ pub struct LinkerOptions {
 }
 
 /// BPF Linker
-pub struct Linker {
+pub struct Linker<'ctx> {
     options: LinkerOptions,
     context: LLVMContextRef,
-    module: LLVMModuleRef,
+    module: Module<'ctx>,
     target_machine: LLVMTargetMachineRef,
     diagnostic_handler: DiagnosticHandler,
 }
 
-impl Linker {
+impl Linker<'_> {
     /// Create a new linker instance with the given options.
     pub fn new(options: LinkerOptions) -> Self {
         Linker {
@@ -452,7 +456,7 @@ impl Linker {
 
         if self.options.btf {
             // if we want to emit BTF, we need to sanitize the debug information
-            llvm::DISanitizer::new(self.context, self.module).run(&self.options.export_symbols);
+            llvm::DISanitizer::new(self.context, self.module).run(&self.options.export_symbols)?;
         } else {
             // if we don't need BTF emission, we can strip DI
             let ok = unsafe { llvm::strip_debug_info(self.module) };
@@ -542,11 +546,10 @@ impl Linker {
             );
             LLVMInstallFatalErrorHandler(Some(llvm::fatal_error));
             LLVMEnablePrettyStackTrace();
-            self.module = llvm::create_module(
+            self.module = Module::new(
                 self.options.output.file_stem().unwrap().to_str().unwrap(),
                 self.context,
-            )
-            .unwrap();
+            );
         }
     }
 }
