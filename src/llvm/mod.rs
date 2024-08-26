@@ -1,6 +1,5 @@
-mod di;
-mod iter;
-mod types;
+pub mod iter;
+pub mod types;
 
 use std::{
     borrow::Cow,
@@ -10,7 +9,6 @@ use std::{
     ptr, slice, str,
 };
 
-pub use di::DISanitizer;
 use iter::{IterModuleFunctions, IterModuleGlobalAliases, IterModuleGlobals};
 use libc::c_char as libc_char;
 use llvm_sys::{

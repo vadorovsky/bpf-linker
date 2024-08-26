@@ -1,6 +1,5 @@
 use std::{
-    borrow::Cow,
-    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap},
     ffi::c_char,
     hash::Hasher,
     ptr,
@@ -10,25 +9,21 @@ use gimli::{DW_TAG_pointer_type, DW_TAG_structure_type, DW_TAG_variant_part};
 use llvm_sys::{core::*, debuginfo::*, prelude::*};
 use tracing::{span, trace, warn, Level};
 
-use super::types::{
-    di::DIType,
-    ir::{Function, MDNode, Metadata, Value},
+use crate::{
+    llvm::{
+        iter::*,
+        types::{
+            di::{DISubprogram, DIType},
+            ir::{Function, MDNode, Metadata, Value},
+        },
+    },
+    Linker,
 };
-use crate::llvm::{iter::*, types::di::DISubprogram};
 
 // KSYM_NAME_LEN from linux kernel intentionally set
 // to lower value found accross kernel versions to ensure
 // backward compatibility
 const MAX_KSYM_NAME_LEN: usize = 128;
-
-pub struct DISanitizer {
-    context: LLVMContextRef,
-    module: LLVMModuleRef,
-    builder: LLVMDIBuilderRef,
-    visited_nodes: HashSet<u64>,
-    replace_operands: HashMap<u64, LLVMMetadataRef>,
-    skipped_types: Vec<String>,
-}
 
 // Sanitize Rust type names to be valid C type names.
 fn sanitize_type_name<T: AsRef<str>>(name: T) -> String {
@@ -58,18 +53,7 @@ fn sanitize_type_name<T: AsRef<str>>(name: T) -> String {
     n
 }
 
-impl DISanitizer {
-    pub fn new(context: LLVMContextRef, module: LLVMModuleRef) -> DISanitizer {
-        DISanitizer {
-            context,
-            module,
-            builder: unsafe { LLVMCreateDIBuilder(module) },
-            visited_nodes: HashSet::new(),
-            replace_operands: HashMap::new(),
-            skipped_types: Vec::new(),
-        }
-    }
-
+impl Linker {
     fn visit_mdnode(&mut self, mdnode: MDNode) {
         match mdnode.try_into().expect("MDNode is not Metadata") {
             Metadata::DICompositeType(mut di_composite_type) => {
@@ -283,10 +267,10 @@ impl DISanitizer {
         }
     }
 
-    pub fn run(mut self, exported_symbols: &HashSet<Cow<'static, str>>) {
+    pub fn sanitize_di(&mut self) {
         let module = self.module;
 
-        self.replace_operands = self.fix_subprogram_linkage(exported_symbols);
+        self.replace_operands = self.fix_subprogram_linkage();
 
         for value in module.globals_iter() {
             self.visit_item(Item::GlobalVariable(value));
@@ -306,7 +290,7 @@ impl DISanitizer {
             );
         }
 
-        unsafe { LLVMDisposeDIBuilder(self.builder) };
+        unsafe { LLVMDisposeDIBuilder(self.di_builder) };
     }
 
     // Make it so that only exported symbols (programs marked as #[no_mangle]) get BTF
@@ -322,10 +306,7 @@ impl DISanitizer {
     // are harder to verify successfully.
     //
     // See tests/btf/assembly/exported-symbols.rs .
-    fn fix_subprogram_linkage(
-        &mut self,
-        export_symbols: &HashSet<Cow<'static, str>>,
-    ) -> HashMap<u64, LLVMMetadataRef> {
+    fn fix_subprogram_linkage(&mut self) -> HashMap<u64, LLVMMetadataRef> {
         let mut replace = HashMap::new();
 
         for mut function in self
@@ -333,7 +314,7 @@ impl DISanitizer {
             .functions_iter()
             .map(|value| unsafe { Function::from_value_ref(value) })
         {
-            if export_symbols.contains(function.name()) {
+            if self.options.export_symbols.contains(function.name()) {
                 continue;
             }
 
@@ -350,7 +331,7 @@ impl DISanitizer {
             // with linkage=static
             let mut new_program = unsafe {
                 let new_program = LLVMDIBuilderCreateFunction(
-                    self.builder,
+                    self.di_builder,
                     subprogram.scope().unwrap(),
                     name.as_ptr() as *const c_char,
                     name.len(),
@@ -368,7 +349,7 @@ impl DISanitizer {
                 // Technically this must be called as part of the builder API, but effectively does
                 // nothing because we don't add any variables through the builder API, instead we
                 // replace retained nodes manually below.
-                LLVMDIBuilderFinalizeSubprogram(self.builder, new_program);
+                LLVMDIBuilderFinalizeSubprogram(self.di_builder, new_program);
 
                 DISubprogram::from_value_ref(LLVMMetadataAsValue(self.context, new_program))
             };
@@ -407,7 +388,7 @@ impl DISanitizer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Item {
+pub(crate) enum Item {
     GlobalVariable(LLVMValueRef),
     GlobalAlias(LLVMValueRef),
     Function(LLVMValueRef),
@@ -418,7 +399,7 @@ enum Item {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Operand {
+pub(crate) struct Operand {
     parent: LLVMValueRef,
     value: LLVMValueRef,
     index: u32,

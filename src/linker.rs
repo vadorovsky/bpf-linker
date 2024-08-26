@@ -1,14 +1,13 @@
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString},
     fs::File,
-    io,
-    io::{Read, Seek},
+    io::{self, Read, Seek},
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
-    ptr, str,
-    str::FromStr,
+    ptr,
+    str::{self, FromStr},
 };
 
 use ar::Archive;
@@ -18,8 +17,9 @@ use llvm_sys::{
         LLVMContextCreate, LLVMContextDispose, LLVMContextSetDiagnosticHandler, LLVMDisposeModule,
         LLVMGetTarget,
     },
+    debuginfo::LLVMCreateDIBuilder,
     error_handling::{LLVMEnablePrettyStackTrace, LLVMInstallFatalErrorHandler},
-    prelude::{LLVMContextRef, LLVMModuleRef},
+    prelude::{LLVMContextRef, LLVMDIBuilderRef, LLVMMetadataRef, LLVMModuleRef},
     target_machine::{LLVMCodeGenFileType, LLVMDisposeTargetMachine, LLVMTargetMachineRef},
 };
 use thiserror::Error;
@@ -225,11 +225,15 @@ pub struct LinkerOptions {
 
 /// BPF Linker
 pub struct Linker {
-    options: LinkerOptions,
-    context: LLVMContextRef,
-    module: LLVMModuleRef,
-    target_machine: LLVMTargetMachineRef,
-    has_errors: bool,
+    pub(crate) options: LinkerOptions,
+    pub(crate) context: LLVMContextRef,
+    pub(crate) module: LLVMModuleRef,
+    pub(crate) di_builder: LLVMDIBuilderRef,
+    pub(crate) target_machine: LLVMTargetMachineRef,
+    pub(crate) has_errors: bool,
+    pub(crate) visited_nodes: HashSet<u64>,
+    pub(crate) replace_operands: HashMap<u64, LLVMMetadataRef>,
+    pub(crate) skipped_types: Vec<String>,
 }
 
 impl Linker {
@@ -239,8 +243,12 @@ impl Linker {
             options,
             context: ptr::null_mut(),
             module: ptr::null_mut(),
+            di_builder: ptr::null_mut(),
             target_machine: ptr::null_mut(),
             has_errors: false,
+            visited_nodes: HashSet::new(),
+            replace_operands: HashMap::new(),
+            skipped_types: Vec::new(),
         }
     }
 
@@ -452,7 +460,7 @@ impl Linker {
 
         if self.options.btf {
             // if we want to emit BTF, we need to sanitize the debug information
-            llvm::DISanitizer::new(self.context, self.module).run(&self.options.export_symbols);
+            self.sanitize_di();
         } else {
             // if we don't need BTF emission, we can strip DI
             let ok = unsafe { llvm::strip_debug_info(self.module) };
@@ -547,6 +555,7 @@ impl Linker {
                 self.context,
             )
             .unwrap();
+            self.di_builder = LLVMCreateDIBuilder(self.module);
         }
     }
 }
