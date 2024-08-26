@@ -8,43 +8,122 @@ use std::{
 
 use llvm_sys::{
     core::{
-        LLVMConstInt, LLVMConstIntGetZExtValue, LLVMCountParams, LLVMDisposeValueMetadataEntries,
-        LLVMGetGEPSourceElementType, LLVMGetIntrinsicDeclaration, LLVMGetNextInstruction,
-        LLVMGetNumOperands, LLVMGetOperand, LLVMGetParam, LLVMGlobalCopyAllMetadata,
-        LLVMGlobalGetValueType, LLVMHasMetadata, LLVMInt32Type, LLVMInt8TypeInContext,
-        LLVMIsAConstantInt, LLVMIsADbgVariableIntrinsic, LLVMIsAFunction, LLVMIsAGetElementPtrInst,
-        LLVMIsAGlobalObject, LLVMIsAInstruction, LLVMIsAIntToPtrInst, LLVMIsALoadInst,
-        LLVMIsAMDNode, LLVMIsAUser, LLVMMDNodeInContext2, LLVMMDStringInContext2,
-        LLVMMetadataAsValue, LLVMPrintTypeToString, LLVMPrintValueToString,
+        LLVMConstInt, LLVMConstIntGetZExtValue, LLVMContextCreate, LLVMContextDispose,
+        LLVMContextSetDiagnosticHandler, LLVMCountParams, LLVMCreateBuilderInContext,
+        LLVMDisposeModule, LLVMDisposeValueMetadataEntries, LLVMGetGEPSourceElementType,
+        LLVMGetIntrinsicDeclaration, LLVMGetNextInstruction, LLVMGetNumOperands, LLVMGetOperand,
+        LLVMGetParam, LLVMGlobalCopyAllMetadata, LLVMGlobalGetValueType, LLVMHasMetadata,
+        LLVMInt32Type, LLVMInt8TypeInContext, LLVMIsAConstantInt, LLVMIsADbgVariableIntrinsic,
+        LLVMIsAFunction, LLVMIsAGetElementPtrInst, LLVMIsAGlobalObject, LLVMIsAInstruction,
+        LLVMIsAIntToPtrInst, LLVMIsALoadInst, LLVMIsAMDNode, LLVMIsAUser, LLVMMDNodeInContext2,
+        LLVMMDStringInContext2, LLVMMetadataAsValue, LLVMModuleCreateWithNameInContext,
+        LLVMPrintDbgRecordToString, LLVMPrintTypeToString, LLVMPrintValueToString,
         LLVMReplaceMDNodeOperandWith, LLVMTypeOf, LLVMValueAsMetadata,
         LLVMValueMetadataEntriesGetKind, LLVMValueMetadataEntriesGetMetadata,
     },
-    debuginfo::{LLVMGetMetadataKind, LLVMGetSubprogram, LLVMMetadataKind, LLVMSetSubprogram},
+    debuginfo::{
+        LLVMCreateDIBuilder, LLVMGetMetadataKind, LLVMGetSubprogram, LLVMMetadataKind,
+        LLVMSetSubprogram,
+    },
     prelude::{
-        LLVMBasicBlockRef, LLVMContextRef, LLVMMetadataRef, LLVMModuleRef, LLVMTypeRef,
-        LLVMValueMetadataEntry, LLVMValueRef,
+        LLVMBasicBlockRef, LLVMBuilderRef, LLVMContextRef, LLVMDIBuilderRef, LLVMDbgRecordRef,
+        LLVMMetadataRef, LLVMModuleRef, LLVMTypeRef, LLVMValueMetadataEntry, LLVMValueRef,
     },
 };
 
 use crate::llvm::{
-    iter::IterBasicBlocks as _,
-    symbol_name,
+    self, symbol_name,
     types::di::{DICompositeType, DIDerivedType, DISubprogram, DIType},
-    Message,
+    LLVMDiagnosticHandler, Message,
 };
 
 use super::di::DILocalVariable;
 
 pub(crate) fn replace_name(
     value_ref: LLVMValueRef,
-    context: LLVMContextRef,
+    context: &mut Context,
     name_operand_index: u32,
     name: &str,
 ) -> Result<(), NulError> {
     let cstr = CString::new(name)?;
-    let name = unsafe { LLVMMDStringInContext2(context, cstr.as_ptr(), name.len()) };
+    let name = unsafe { LLVMMDStringInContext2(context.context_ref(), cstr.as_ptr(), name.len()) };
     unsafe { LLVMReplaceMDNodeOperandWith(value_ref, name_operand_index, name) };
     Ok(())
+}
+
+#[derive(Clone)]
+pub struct Context<'ctx> {
+    context_ref: LLVMContextRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> Drop for Context<'ctx> {
+    fn drop(&mut self) {
+        tracing::debug!("dropping context");
+        unsafe { LLVMContextDispose(self.context_ref) }
+    }
+}
+
+impl<'ctx> Context<'ctx> {
+    pub fn new() -> Self {
+        let context_ref = unsafe { LLVMContextCreate() };
+        Self {
+            context_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn context_ref(&self) -> LLVMContextRef {
+        self.context_ref
+    }
+
+    pub fn create_builder(&mut self) -> LLVMBuilderRef {
+        unsafe { LLVMCreateBuilderInContext(self.context_ref) }
+    }
+
+    pub fn create_module(&mut self, name: &str) -> Module<'ctx> {
+        let c_name = CString::new(name).unwrap();
+        let module_ref =
+            unsafe { LLVMModuleCreateWithNameInContext(c_name.as_ptr(), self.context_ref) };
+
+        Module {
+            module_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn set_diagnostic_handler<T: LLVMDiagnosticHandler>(&mut self, diagnostic_handler: &mut T) {
+        unsafe {
+            LLVMContextSetDiagnosticHandler(
+                self.context_ref,
+                Some(llvm::diagnostic_handler::<T>),
+                diagnostic_handler as *mut _ as _,
+            )
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Module<'ctx> {
+    module_ref: LLVMModuleRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> Drop for Module<'ctx> {
+    fn drop(&mut self) {
+        tracing::debug!("dropping module");
+        unsafe { LLVMDisposeModule(self.module_ref) }
+    }
+}
+
+impl<'ctx> Module<'ctx> {
+    pub fn create_di_builder(&mut self) -> LLVMDIBuilderRef {
+        unsafe { LLVMCreateDIBuilder(self.module_ref) }
+    }
+
+    pub fn module_ref(&self) -> LLVMModuleRef {
+        self.module_ref
+    }
 }
 
 pub trait ValueRef {
@@ -207,6 +286,25 @@ impl<'ctx> Value<'ctx> {
 }
 
 #[derive(Clone)]
+pub struct BasicBlock<'ctx> {
+    basic_block_ref: LLVMBasicBlockRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> BasicBlock<'ctx> {
+    pub fn from_basic_block_ref(basic_block_ref: LLVMBasicBlockRef) -> Self {
+        Self {
+            basic_block_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn basic_block_ref(&self) -> LLVMBasicBlockRef {
+        self.basic_block_ref
+    }
+}
+
+#[derive(Clone)]
 pub enum Metadata<'ctx> {
     MDNode(MDNode<'ctx>),
     DIDerivedType(DIDerivedType<'ctx>),
@@ -347,6 +445,20 @@ pub struct MDNode<'ctx> {
     _marker: PhantomData<&'ctx ()>,
 }
 
+impl<'ctx> std::fmt::Debug for MDNode<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value_str = Message {
+            ptr: unsafe { LLVMPrintValueToString(self.value_ref) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        f.debug_struct("MDNode").field("value", &value_str).finish()
+    }
+}
+
 impl<'ctx> ValueRef for MDNode<'ctx> {
     fn value_ref(&self) -> LLVMValueRef {
         self.value_ref
@@ -363,10 +475,10 @@ impl<'ctx> MDNode<'ctx> {
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any validation checks.
     pub(crate) unsafe fn from_metadata_ref(
-        context: LLVMContextRef,
+        context: &mut Context,
         metadata: LLVMMetadataRef,
     ) -> Self {
-        MDNode::from_value_ref(LLVMMetadataAsValue(context, metadata))
+        MDNode::from_value_ref(LLVMMetadataAsValue(context.context_ref(), metadata))
     }
 
     /// Constructs a new [`MDNode`] from the given `value`.
@@ -385,8 +497,9 @@ impl<'ctx> MDNode<'ctx> {
     }
 
     /// Constructs an empty metadata node.
-    pub fn empty(context: LLVMContextRef) -> Self {
-        let metadata = unsafe { LLVMMDNodeInContext2(context, core::ptr::null_mut(), 0) };
+    pub fn empty(context: &mut Context) -> Self {
+        let metadata =
+            unsafe { LLVMMDNodeInContext2(context.context_ref(), core::ptr::null_mut(), 0) };
         unsafe { Self::from_metadata_ref(context, metadata) }
     }
 
@@ -395,14 +508,14 @@ impl<'ctx> MDNode<'ctx> {
     /// This function is used to create composite metadata structures, such as
     /// arrays or tuples of different types or values, which can then be used
     /// to represent complex data structures within the metadata system.
-    pub fn with_elements(context: LLVMContextRef, elements: &[DIType]) -> Self {
+    pub fn with_elements(context: &mut Context, elements: &[DIType]) -> Self {
         let metadata = unsafe {
             let mut elements: Vec<LLVMMetadataRef> = elements
                 .iter()
                 .map(|di_type| LLVMValueAsMetadata(di_type.value_ref))
                 .collect();
             LLVMMDNodeInContext2(
-                context,
+                context.context_ref(),
                 elements.as_mut_slice().as_mut_ptr(),
                 elements.len(),
             )
@@ -534,12 +647,12 @@ impl<'ctx> Function<'ctx> {
         }
     }
 
-    pub fn intrinsic_declaration(module: LLVMModuleRef, id: u32, param_types: &[Type]) -> Self {
+    pub fn intrinsic_declaration(module: &mut Module, id: u32, param_types: &[Type]) -> Self {
         let mut param_types: Vec<LLVMTypeRef> =
             param_types.into_iter().map(|t| t.type_ref).collect();
         unsafe {
             let value_ref = LLVMGetIntrinsicDeclaration(
-                module,
+                module.module_ref(),
                 id,
                 param_types.as_mut_ptr(),
                 param_types.len(),
@@ -558,14 +671,10 @@ impl<'ctx> Function<'ctx> {
         (0..params_count).map(move |i| unsafe { LLVMGetParam(value, i) })
     }
 
-    pub(crate) fn basic_blocks(&self) -> impl Iterator<Item = LLVMBasicBlockRef> + '_ {
-        self.value_ref.basic_blocks_iter()
-    }
-
-    pub(crate) fn subprogram(&self, context: LLVMContextRef) -> Option<DISubprogram<'ctx>> {
+    pub(crate) fn subprogram(&self, context: &mut Context) -> Option<DISubprogram<'ctx>> {
         let subprogram = unsafe { LLVMGetSubprogram(self.value_ref) };
         NonNull::new(subprogram).map(|_| unsafe {
-            DISubprogram::from_value_ref(LLVMMetadataAsValue(context, subprogram))
+            DISubprogram::from_value_ref(LLVMMetadataAsValue(context.context_ref(), subprogram))
         })
     }
 
@@ -610,6 +719,12 @@ impl<'ctx> Instruction<'ctx> {
         }
         Instruction::Other(value)
     }
+
+    // pub fn dbg_records(&self) -> impl Iterator<Item = DbgRecord> + '_ {
+    //     self.value_ref()
+    //         .dbg_records_iter()
+    //         .map(|dbg_record_ref| DbgRecord::from_dbg_record_ref(dbg_record_ref))
+    // }
 
     pub fn has_metadata(&self) -> bool {
         unsafe { LLVMHasMetadata(self.value_ref()) > 0 }
@@ -894,10 +1009,41 @@ impl<'ctx> Type<'ctx> {
         }
     }
 
-    pub fn int8(context: LLVMContextRef) -> Self {
+    pub fn int8(context: &mut Context) -> Self {
         unsafe {
-            let type_ref = LLVMInt8TypeInContext(context);
+            let type_ref = LLVMInt8TypeInContext(context.context_ref());
             Type::from_type_ref(type_ref)
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct DbgRecord<'ctx> {
+    pub dbg_record_ref: LLVMDbgRecordRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> std::fmt::Debug for DbgRecord<'ctx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dbg_record_string = Message {
+            ptr: unsafe { LLVMPrintDbgRecordToString(self.dbg_record_ref) },
+        }
+        .as_c_str()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+        f.debug_struct("DbgRecord")
+            .field("dbg_record", &dbg_record_string)
+            .finish()
+    }
+}
+
+impl<'ctx> DbgRecord<'ctx> {
+    pub(crate) fn from_dbg_record_ref(dbg_record_ref: LLVMDbgRecordRef) -> Self {
+        Self {
+            dbg_record_ref,
+            _marker: PhantomData,
         }
     }
 }

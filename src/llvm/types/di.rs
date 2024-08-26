@@ -16,7 +16,10 @@ use llvm_sys::{
     prelude::{LLVMContextRef, LLVMMetadataRef, LLVMValueRef},
 };
 
-use crate::llvm::{mdstring_to_str, types::ir::MDNode};
+use crate::llvm::{
+    mdstring_to_str,
+    types::ir::{Context, MDNode},
+};
 
 use super::ir::{Metadata, ValueRef};
 
@@ -266,7 +269,7 @@ impl<'ctx> DIDerivedType<'ctx> {
     ///
     /// Returns a `NulError` if the new name contains a NUL byte, as it cannot
     /// be converted into a `CString`.
-    pub fn replace_name(&mut self, context: LLVMContextRef, name: &str) -> Result<(), NulError> {
+    pub fn replace_name(&mut self, context: &mut Context, name: &str) -> Result<(), NulError> {
         super::ir::replace_name(self.value_ref, context, DITypeOperand::Name as u32, name)
     }
 
@@ -376,7 +379,7 @@ impl<'ctx> DICompositeType<'ctx> {
     ///
     /// Returns a `NulError` if the new name contains a NUL byte, as it cannot
     /// be converted into a `CString`.
-    pub fn replace_name(&mut self, context: LLVMContextRef, name: &str) -> Result<(), NulError> {
+    pub fn replace_name(&mut self, context: &mut Context, name: &str) -> Result<(), NulError> {
         super::ir::replace_name(self.value_ref, context, DITypeOperand::Name as u32, name)
     }
 
@@ -467,7 +470,7 @@ impl<'ctx> DISubprogram<'ctx> {
     ///
     /// Returns a `NulError` if the new name contains a NUL byte, as it cannot
     /// be converted into a `CString`.
-    pub fn replace_name(&mut self, context: LLVMContextRef, name: &str) -> Result<(), NulError> {
+    pub fn replace_name(&mut self, context: &mut Context, name: &str) -> Result<(), NulError> {
         super::ir::replace_name(
             self.value_ref,
             context,

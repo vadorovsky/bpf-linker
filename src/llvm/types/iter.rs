@@ -2,30 +2,45 @@ use std::marker::PhantomData;
 
 use llvm_sys::{
     core::{
-        LLVMGetFirstBasicBlock, LLVMGetFirstFunction, LLVMGetFirstGlobal, LLVMGetFirstGlobalAlias,
-        LLVMGetFirstInstruction, LLVMGetLastBasicBlock, LLVMGetLastFunction, LLVMGetLastGlobal,
-        LLVMGetLastGlobalAlias, LLVMGetLastInstruction, LLVMGetNextBasicBlock, LLVMGetNextFunction,
+        LLVMGetFirstBasicBlock, LLVMGetFirstDbgRecord, LLVMGetFirstFunction, LLVMGetFirstGlobal,
+        LLVMGetFirstGlobalAlias, LLVMGetFirstInstruction, LLVMGetLastBasicBlock,
+        LLVMGetLastDbgRecord, LLVMGetLastFunction, LLVMGetLastGlobal, LLVMGetLastGlobalAlias,
+        LLVMGetLastInstruction, LLVMGetNextBasicBlock, LLVMGetNextDbgRecord, LLVMGetNextFunction,
         LLVMGetNextGlobal, LLVMGetNextGlobalAlias, LLVMGetNextInstruction,
     },
-    prelude::{LLVMBasicBlockRef, LLVMModuleRef, LLVMValueRef},
+    prelude::{LLVMBasicBlockRef, LLVMDbgRecordRef, LLVMModuleRef, LLVMValueRef},
+};
+
+use crate::llvm::types::ir::{
+    BasicBlock, DbgRecord, Function, Instruction, Module, Value, ValueRef,
 };
 
 macro_rules! llvm_iterator {
-    ($trait_name:ident, $iterator_name:ident, $iterable:ty, $method_name:ident, $item_ty:ty, $first:expr, $last:expr, $next:expr $(,)?) => {
+    (
+        $trait_name:ident,
+        $iterator_name:ident,
+        $iterable:ident,
+        $method_name:ident,
+        $item_ty:ty,
+        $first:expr,
+        $last:expr,
+        $next:expr,
+        $ref_method:ident $(,)?
+    ) => {
         pub trait $trait_name {
             fn $method_name(&self) -> $iterator_name;
         }
 
         pub struct $iterator_name<'a> {
-            lifetime: PhantomData<&'a $iterable>,
+            lifetime: PhantomData<&'a $iterable<'a>>,
             next: $item_ty,
             last: $item_ty,
         }
 
-        impl $trait_name for $iterable {
+        impl<'ctx> $trait_name for $iterable<'ctx> {
             fn $method_name(&self) -> $iterator_name {
-                let first = unsafe { $first(*self) };
-                let last = unsafe { $last(*self) };
+                let first = unsafe { $first(self.$ref_method()) };
+                let last = unsafe { $last(self.$ref_method()) };
                 assert_eq!(first.is_null(), last.is_null());
                 $iterator_name {
                     lifetime: PhantomData,
@@ -50,7 +65,7 @@ macro_rules! llvm_iterator {
                 let last = *next == *last;
                 let item = *next;
                 *next = unsafe { $next(*next) };
-                // assert_eq!(next.is_null(), last);
+                assert_eq!(next.is_null(), last);
                 Some(item)
             }
         }
@@ -60,54 +75,72 @@ macro_rules! llvm_iterator {
 llvm_iterator! {
     IterModuleGlobals,
     GlobalsIter,
-    LLVMModuleRef,
+    Module,
     globals_iter,
     LLVMValueRef,
     LLVMGetFirstGlobal,
     LLVMGetLastGlobal,
     LLVMGetNextGlobal,
+    module_ref,
 }
 
 llvm_iterator! {
     IterModuleGlobalAliases,
     GlobalAliasesIter,
-    LLVMModuleRef,
+    Module,
     global_aliases_iter,
     LLVMValueRef,
     LLVMGetFirstGlobalAlias,
     LLVMGetLastGlobalAlias,
     LLVMGetNextGlobalAlias,
+    module_ref,
 }
 
 llvm_iterator! {
     IterModuleFunctions,
     FunctionsIter,
-    LLVMModuleRef,
+    Module,
     functions_iter,
     LLVMValueRef,
     LLVMGetFirstFunction,
     LLVMGetLastFunction,
     LLVMGetNextFunction,
+    module_ref,
 }
 
 llvm_iterator!(
     IterBasicBlocks,
     BasicBlockIter,
-    LLVMValueRef,
+    Function,
     basic_blocks_iter,
     LLVMBasicBlockRef,
     LLVMGetFirstBasicBlock,
     LLVMGetLastBasicBlock,
-    LLVMGetNextBasicBlock
+    LLVMGetNextBasicBlock,
+    value_ref,
 );
 
 llvm_iterator!(
     IterInstructions,
     InstructionsIter,
-    LLVMBasicBlockRef,
+    BasicBlock,
     instructions_iter,
     LLVMValueRef,
     LLVMGetFirstInstruction,
     LLVMGetLastInstruction,
-    LLVMGetNextInstruction
+    LLVMGetNextInstruction,
+    basic_block_ref,
+);
+
+llvm_iterator!(
+    IterDbgRecords,
+    DbgRecordsIter,
+    // LLVMValueRef,
+    Instruction,
+    dbg_records_iter,
+    LLVMDbgRecordRef,
+    LLVMGetFirstDbgRecord,
+    LLVMGetLastDbgRecord,
+    LLVMGetNextDbgRecord,
+    value_ref,
 );

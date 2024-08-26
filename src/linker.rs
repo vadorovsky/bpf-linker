@@ -25,7 +25,10 @@ use llvm_sys::{
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use crate::llvm;
+use crate::llvm::{
+    self,
+    types::ir::{Context, Module},
+};
 
 /// Linker error
 #[derive(Debug, Error)]
@@ -224,21 +227,65 @@ pub struct LinkerOptions {
 }
 
 /// BPF Linker
-pub struct Linker {
+pub struct Linker<'ctx> {
     options: LinkerOptions,
-    context: LLVMContextRef,
-    module: LLVMModuleRef,
+    context: Context<'ctx>,
+    module: Module<'ctx>,
     target_machine: LLVMTargetMachineRef,
     has_errors: bool,
 }
 
-impl Linker {
+impl<'ctx> Linker<'ctx> {
     /// Create a new linker instance with the given options.
     pub fn new(options: LinkerOptions) -> Self {
+        let mut args = Vec::<Cow<str>>::new();
+        args.push("bpf-linker".into());
+        args.push("-debug".into());
+        // Disable cold call site detection. Many accessors in aya-ebpf return Result<T, E>
+        // where the layout is larger than 64 bits, but the LLVM BPF target only supports
+        // up to 64 bits return values. Since the accessors are tiny in terms of code, we
+        // avoid the issue by annotating them with #[inline(always)]. If they are classified
+        // as cold though - and they often are starting from LLVM17 - #[inline(always)]
+        // is ignored and the BPF target fails codegen.
+        args.push("--cold-callsite-rel-freq=0".into());
+        if options.unroll_loops {
+            // setting cmdline arguments is the only way to customize the unroll pass with the
+            // C API.
+            args.extend([
+                "--unroll-runtime".into(),
+                "--unroll-runtime-multi-exit".into(),
+                format!("--unroll-max-upperbound={}", u32::MAX).into(),
+                format!("--unroll-threshold={}", u32::MAX).into(),
+            ]);
+        }
+        if !options.disable_expand_memcpy_in_order {
+            args.push("--bpf-expand-memcpy-in-order".into());
+        }
+        args.extend(options.llvm_args.iter().map(Into::into));
+        info!("LLVM command line: {:?}", args);
+        unsafe {
+            llvm::init(&args, "BPF linker");
+        }
+
+        let mut context = Context::new();
+        // context.set_diagnostic_handler(self);
+
+        unsafe {
+            // LLVMContextSetDiagnosticHandler(
+            //     context.context_ref(),
+            //     Some(llvm::diagnostic_handler::<Self>),
+            //     self as *mut _ as _,
+            // );
+            LLVMInstallFatalErrorHandler(Some(llvm::fatal_error));
+            LLVMEnablePrettyStackTrace();
+        }
+
+        let module = context.create_module(options.output.file_stem().unwrap().to_str().unwrap());
+
         Linker {
             options,
-            context: ptr::null_mut(),
-            module: ptr::null_mut(),
+            context,
+            module,
             target_machine: ptr::null_mut(),
             has_errors: false,
         }
@@ -352,7 +399,7 @@ impl Linker {
         use InputType::*;
         let bitcode = match in_type {
             Bitcode => data,
-            Elf => match unsafe { llvm::find_embedded_bitcode(self.context, &data) } {
+            Elf => match unsafe { llvm::find_embedded_bitcode(&mut self.context, &data) } {
                 Ok(Some(bitcode)) => bitcode,
                 Ok(None) => return Err(LinkerError::MissingBitcodeSection(path.to_owned())),
                 Err(e) => return Err(LinkerError::EmbeddedBitcodeError(e)),
@@ -365,7 +412,7 @@ impl Linker {
             Archive => panic!("nested archives not supported duh"),
         };
 
-        if unsafe { !llvm::link_bitcode_buffer(self.context, self.module, &bitcode) } {
+        if unsafe { !llvm::link_bitcode_buffer(&mut self.context, &mut self.module, &bitcode) } {
             return Err(LinkerError::LinkModuleError(path.to_owned()));
         }
 
@@ -407,11 +454,11 @@ impl Linker {
                 })
             }
             None => {
-                let c_triple = unsafe { LLVMGetTarget(*module) };
+                let c_triple = unsafe { LLVMGetTarget(module.module_ref()) };
                 let triple = unsafe { CStr::from_ptr(c_triple) }.to_str().unwrap();
                 if triple.starts_with("bpf") {
                     // case 2
-                    (triple, unsafe { llvm::target_from_module(*module) })
+                    (triple, unsafe { llvm::target_from_module(&module) })
                 } else {
                     // case 3.
                     info!("detected non-bpf input target {} and no explicit output --target specified, selecting `bpf'", triple);
@@ -452,23 +499,27 @@ impl Linker {
 
         if self.options.btf {
             // if we want to emit BTF, we need to sanitize the debug information
-            llvm::DISanitizer::new(self.context, self.module).run(&self.options.export_symbols);
+            llvm::DISanitizer::new(self.context.clone(), self.module.clone())
+                .run(&self.options.export_symbols);
+            debug!("done with sanitizing");
         } else {
             // if we don't need BTF emission, we can strip DI
-            let ok = unsafe { llvm::strip_debug_info(self.module) };
+            let ok = unsafe { llvm::strip_debug_info(&mut self.module) };
             debug!("Stripping DI, changed={}", ok);
         }
 
+        debug!("about to optimize");
         unsafe {
             llvm::optimize(
                 self.target_machine,
-                self.module,
+                &mut self.module,
                 self.options.optimize,
                 self.options.ignore_inline_never,
                 &self.options.export_symbols,
             )
         }
         .map_err(LinkerError::OptimizeError)?;
+        debug!("optimized");
 
         Ok(())
     }
@@ -486,7 +537,7 @@ impl Linker {
     fn write_bitcode(&mut self, output: &CStr) -> Result<(), LinkerError> {
         info!("writing bitcode to {:?}", output);
 
-        if unsafe { LLVMWriteBitcodeToFile(self.module, output.as_ptr()) } == 1 {
+        if unsafe { LLVMWriteBitcodeToFile(self.module.module_ref(), output.as_ptr()) } == 1 {
             return Err(LinkerError::WriteBitcodeError);
         }
 
@@ -496,63 +547,28 @@ impl Linker {
     fn write_ir(&mut self, output: &CStr) -> Result<(), LinkerError> {
         info!("writing IR to {:?}", output);
 
-        unsafe { llvm::write_ir(self.module, output) }.map_err(LinkerError::WriteIRError)
+        unsafe { llvm::write_ir(&mut self.module, output) }.map_err(LinkerError::WriteIRError)
     }
 
     fn emit(&mut self, output: &CStr, output_type: LLVMCodeGenFileType) -> Result<(), LinkerError> {
         info!("emitting {:?} to {:?}", output_type, output);
 
-        unsafe { llvm::codegen(self.target_machine, self.module, output, output_type) }
+        unsafe { llvm::codegen(self.target_machine, &mut self.module, output, output_type) }
             .map_err(LinkerError::EmitCodeError)
     }
 
     fn llvm_init(&mut self) {
-        let mut args = Vec::<Cow<str>>::new();
-        args.push("bpf-linker".into());
-        args.push("-debug".into());
-        // Disable cold call site detection. Many accessors in aya-ebpf return Result<T, E>
-        // where the layout is larger than 64 bits, but the LLVM BPF target only supports
-        // up to 64 bits return values. Since the accessors are tiny in terms of code, we
-        // avoid the issue by annotating them with #[inline(always)]. If they are classified
-        // as cold though - and they often are starting from LLVM17 - #[inline(always)]
-        // is ignored and the BPF target fails codegen.
-        args.push("--cold-callsite-rel-freq=0".into());
-        if self.options.unroll_loops {
-            // setting cmdline arguments is the only way to customize the unroll pass with the
-            // C API.
-            args.extend([
-                "--unroll-runtime".into(),
-                "--unroll-runtime-multi-exit".into(),
-                format!("--unroll-max-upperbound={}", u32::MAX).into(),
-                format!("--unroll-threshold={}", u32::MAX).into(),
-            ]);
-        }
-        if !self.options.disable_expand_memcpy_in_order {
-            args.push("--bpf-expand-memcpy-in-order".into());
-        }
-        args.extend(self.options.llvm_args.iter().map(Into::into));
-        info!("LLVM command line: {:?}", args);
         unsafe {
-            llvm::init(&args, "BPF linker");
-
-            self.context = LLVMContextCreate();
             LLVMContextSetDiagnosticHandler(
-                self.context,
+                self.context.context_ref(),
                 Some(llvm::diagnostic_handler::<Self>),
                 self as *mut _ as _,
             );
-            LLVMInstallFatalErrorHandler(Some(llvm::fatal_error));
-            LLVMEnablePrettyStackTrace();
-            self.module = llvm::create_module(
-                self.options.output.file_stem().unwrap().to_str().unwrap(),
-                self.context,
-            )
-            .unwrap();
         }
     }
 }
 
-impl llvm::LLVMDiagnosticHandler for Linker {
+impl<'ctx> llvm::LLVMDiagnosticHandler for Linker<'ctx> {
     fn handle_diagnostic(&mut self, severity: llvm_sys::LLVMDiagnosticSeverity, message: &str) {
         // TODO(https://reviews.llvm.org/D155894): Remove this when LLVM no longer emits these
         // errors.
@@ -583,18 +599,18 @@ impl llvm::LLVMDiagnosticHandler for Linker {
     }
 }
 
-impl Drop for Linker {
+impl<'ctx> Drop for Linker<'ctx> {
     fn drop(&mut self) {
         unsafe {
             if !self.target_machine.is_null() {
                 LLVMDisposeTargetMachine(self.target_machine);
             }
-            if !self.module.is_null() {
-                LLVMDisposeModule(self.module);
-            }
-            if !self.context.is_null() {
-                LLVMContextDispose(self.context);
-            }
+            // if !self.module.is_null() {
+            //     LLVMDisposeModule(self.module);
+            // }
+            // if !self.context.is_null() {
+            //     LLVMContextDispose(self.context);
+            // }
         }
     }
 }

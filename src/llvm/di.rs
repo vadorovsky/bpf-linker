@@ -15,15 +15,15 @@ use super::{
     intrinsic::llvm_preserve_array_access_index_id,
     types::{
         di::DIType,
-        ir::{Function, IntToPtrInst, MDNode, Operands, Type, User, Value, ValueRef},
+        ir::{Context, Function, IntToPtrInst, MDNode, Operands, Type, User, Value, ValueRef},
     },
 };
 use crate::llvm::{
     intrinsic::llvm_preserve_struct_access_index_id,
-    iter::*,
     types::{
         di::{DISubprogram, DIVariable},
-        ir::{ConstantInt, Instruction, LoadInst, Metadata, MetadataEntries},
+        ir::{BasicBlock, ConstantInt, Instruction, LoadInst, Metadata, MetadataEntries, Module},
+        iter::*,
     },
     Message,
 };
@@ -34,8 +34,8 @@ use crate::llvm::{
 const MAX_KSYM_NAME_LEN: usize = 128;
 
 pub struct DISanitizer<'ctx> {
-    context: LLVMContextRef,
-    module: LLVMModuleRef,
+    context: Context<'ctx>,
+    module: Module<'ctx>,
     builder: LLVMBuilderRef,
     di_builder: LLVMDIBuilderRef,
     visited_nodes: HashSet<u64>,
@@ -73,12 +73,14 @@ fn sanitize_type_name<T: AsRef<str>>(name: T) -> String {
 }
 
 impl<'ctx> DISanitizer<'ctx> {
-    pub fn new(context: LLVMContextRef, module: LLVMModuleRef) -> DISanitizer<'ctx> {
+    pub fn new(mut context: Context<'ctx>, mut module: Module<'ctx>) -> DISanitizer<'ctx> {
+        let builder = context.create_builder();
+        let di_builder = module.create_di_builder();
         DISanitizer {
             context,
             module,
-            builder: unsafe { LLVMCreateBuilderInContext(context) },
-            di_builder: unsafe { LLVMCreateDIBuilder(module) },
+            builder,
+            di_builder,
             visited_nodes: HashSet::new(),
             item_stack: Vec::new(),
             replace_operands: HashMap::new(),
@@ -184,22 +186,24 @@ impl<'ctx> DISanitizer<'ctx> {
                             }
                         }
                         if is_data_carrying_enum {
-                            di_composite_type.replace_elements(MDNode::empty(self.context));
+                            di_composite_type.replace_elements(MDNode::empty(&mut self.context));
                         } else if !members.is_empty() {
                             members.sort_by_cached_key(|di_type| di_type.offset_in_bits());
                             let sorted_elements =
-                                MDNode::with_elements(self.context, members.as_mut_slice());
+                                MDNode::with_elements(&mut self.context, members.as_mut_slice());
                             di_composite_type.replace_elements(sorted_elements);
                         }
                         if remove_name {
                             // `AyaBtfMapMarker` is a type which is used in fields of BTF map
                             // structs. We need to make such structs anonymous in order to get
                             // BTF maps accepted by the Linux kernel.
-                            di_composite_type.replace_name(self.context, "").unwrap();
+                            di_composite_type
+                                .replace_name(&mut self.context, "")
+                                .unwrap();
                         } else if let Some((_, sanitized_name)) = names {
                             // Clear the name from characters incompatible with C.
                             di_composite_type
-                                .replace_name(self.context, sanitized_name.as_str())
+                                .replace_name(&mut self.context, sanitized_name.as_str())
                                 .unwrap();
                         }
                     }
@@ -212,7 +216,7 @@ impl<'ctx> DISanitizer<'ctx> {
                 match di_derived_type.tag() {
                     DW_TAG_pointer_type => {
                         // remove rust names
-                        di_derived_type.replace_name(self.context, "").unwrap();
+                        di_derived_type.replace_name(&mut self.context, "").unwrap();
                     }
                     _ => (),
                 }
@@ -222,7 +226,7 @@ impl<'ctx> DISanitizer<'ctx> {
                 if let Some(name) = di_subprogram.name() {
                     let name = sanitize_type_name(name);
                     di_subprogram
-                        .replace_name(self.context, name.as_str())
+                        .replace_name(&mut self.context, name.as_str())
                         .unwrap();
                 }
             }
@@ -253,7 +257,9 @@ impl<'ctx> DISanitizer<'ctx> {
             // seen its value or not, since the same value can appear as an operand in multiple
             // nodes in the tree.
             if let Some(new_metadata) = self.replace_operands.get(&value_id) {
-                operand.replace(unsafe { LLVMMetadataAsValue(self.context, *new_metadata) })
+                operand.replace(unsafe {
+                    LLVMMetadataAsValue(self.context.context_ref(), *new_metadata)
+                })
             }
         }
 
@@ -313,7 +319,8 @@ impl<'ctx> DISanitizer<'ctx> {
 
         if let Some(entries) = value.metadata_entries() {
             for (index, (metadata, kind)) in entries.iter().enumerate() {
-                let metadata_value = unsafe { LLVMMetadataAsValue(self.context, metadata) };
+                let metadata_value =
+                    unsafe { LLVMMetadataAsValue(self.context.context_ref(), metadata) };
                 self.visit_item(Item::MetadataEntry(metadata_value, kind, index));
             }
         }
@@ -325,7 +332,8 @@ impl<'ctx> DISanitizer<'ctx> {
                 self.visit_item(Item::FunctionParam(param));
             }
 
-            for basic_block in fun.basic_blocks() {
+            for basic_block in fun.basic_blocks_iter() {
+                let basic_block = BasicBlock::from_basic_block_ref(basic_block);
                 for instruction in basic_block.instructions_iter() {
                     self.visit_item(Item::Instruction(Instruction::new(instruction)));
                 }
@@ -352,22 +360,22 @@ impl<'ctx> DISanitizer<'ctx> {
                     let gep_index = constant_int.unsigned() as u32;
                     debug!("GEP index: {gep_index:?}");
 
-                    let pointer_operand = get_element_ptr.pointer_operand();
+                    // let pointer_operand = get_element_ptr.pointer_operand();
 
-                    if let Value::User(User::Instruction(Instruction::IntToPtrInst(
-                        int_to_ptr_inst,
-                    ))) = pointer_operand
-                    {
-                        self.visit_int_to_ptr_inst(
-                            int_to_ptr_inst,
-                            // base.clone(),
-                            // base_type,
-                            // result_type,
-                            load_inst.clone(),
-                            source_element_type,
-                            gep_index,
-                        )
-                    }
+                    // if let Value::User(User::Instruction(Instruction::IntToPtrInst(
+                    //     int_to_ptr_inst,
+                    // ))) = pointer_operand
+                    // {
+                    //     self.visit_int_to_ptr_inst(
+                    //         int_to_ptr_inst,
+                    //         // base.clone(),
+                    //         // base_type,
+                    //         // result_type,
+                    //         load_inst.clone(),
+                    //         source_element_type,
+                    //         gep_index,
+                    //     )
+                    // }
                 }
 
                 // for (i, index) in get_element_ptr.indices().enumerate() {}
@@ -387,14 +395,14 @@ impl<'ctx> DISanitizer<'ctx> {
             }
             // When `load is used for accessing the first struct field:
             Value::User(User::Instruction(Instruction::IntToPtrInst(int_to_ptr_inst))) => {
-                let source_element_type = Type::int8(self.context);
+                let source_element_type = Type::int8(&mut self.context);
                 debug!("NO GEP ELEMENT TYPE: {source_element_type:?}");
-                self.visit_int_to_ptr_inst(
-                    int_to_ptr_inst,
-                    load_inst.clone(),
-                    source_element_type,
-                    0,
-                )
+                // self.visit_int_to_ptr_inst(
+                //     int_to_ptr_inst,
+                //     load_inst.clone(),
+                //     source_element_type,
+                //     0,
+                // )
             }
             _ => {}
         }
@@ -420,6 +428,18 @@ impl<'ctx> DISanitizer<'ctx> {
         };
         let metadata = Value::new(metadata);
         debug!("METADATA: {metadata:?}");
+
+        let debug_loc = unsafe { LLVMInstructionGetDebugLoc(int_to_ptr.value_ref()) };
+        let debug_loc = unsafe { MDNode::from_metadata_ref(&mut self.context, debug_loc) };
+        debug!("DEBUG_LOC: {debug_loc:?}");
+
+        for (i, dbg_record) in int_to_ptr.dbg_records_iter().enumerate() {
+            let dbg_record_m = Message {
+                ptr: unsafe { LLVMPrintDbgRecordToString(dbg_record) },
+            };
+            let dbg_record_s = dbg_record_m.as_c_str().unwrap().to_str().unwrap();
+            debug!("DBG_RECORD: {i}: {dbg_record_s}");
+        }
 
         debug!("PREV_INST: {int_to_ptr:?}");
         let next_instruction = int_to_ptr.next_instruction();
@@ -493,8 +513,11 @@ impl<'ctx> DISanitizer<'ctx> {
         let intrinsic_id = llvm_preserve_array_access_index_id();
         debug!("intrinsic_id: {intrinsic_id}");
 
-        let fn_preserve_array_access_index =
-            Function::intrinsic_declaration(self.module, intrinsic_id, &[result_type, base_type]);
+        let fn_preserve_array_access_index = Function::intrinsic_declaration(
+            &mut self.module,
+            intrinsic_id,
+            &[result_type, base_type],
+        );
         // let fn_preserve_array_access_index = unsafe {
         //     LLVMGetIntrinsicDeclaration(self.module, intrinsic_id, intrinsic_types.as_mut_ptr(), 2)
         // };
@@ -572,19 +595,27 @@ impl<'ctx> DISanitizer<'ctx> {
     }
 
     pub fn run(mut self, exported_symbols: &HashSet<Cow<'static, str>>) {
-        let module = self.module;
+        // let module = self.module;
 
         self.replace_operands = self.fix_subprogram_linkage(exported_symbols);
 
-        for value in module.globals_iter() {
-            self.visit_item(Item::GlobalVariable(value));
+        let mut items = Vec::new();
+        for value in self.module.globals_iter() {
+            // self.visit_item(Item::GlobalVariable(value));
+            items.push(Item::GlobalVariable(value));
         }
-        for value in module.global_aliases_iter() {
-            self.visit_item(Item::GlobalAlias(value));
+        for value in self.module.global_aliases_iter() {
+            // self.visit_item(Item::GlobalAlias(value));
+            items.push(Item::GlobalAlias(value));
         }
 
-        for function in module.functions_iter() {
-            self.visit_item(Item::Function(function));
+        for function in self.module.functions_iter() {
+            // self.visit_item(Item::Function(function));
+            items.push(Item::Function(function));
+        }
+
+        for item in items {
+            self.visit_item(item);
         }
 
         if !self.skipped_types.is_empty() {
@@ -594,7 +625,9 @@ impl<'ctx> DISanitizer<'ctx> {
             );
         }
 
+        debug!("bazinga");
         unsafe { LLVMDisposeDIBuilder(self.di_builder) };
+        debug!("ayy lmao");
     }
 
     // Make it so that only exported symbols (programs marked as #[no_mangle]) get BTF
@@ -626,7 +659,7 @@ impl<'ctx> DISanitizer<'ctx> {
             }
 
             // Skip functions that don't have subprograms.
-            let Some(mut subprogram) = function.subprogram(self.context) else {
+            let Some(mut subprogram) = function.subprogram(&mut self.context) else {
                 continue;
             };
 
@@ -658,7 +691,10 @@ impl<'ctx> DISanitizer<'ctx> {
                 // replace retained nodes manually below.
                 LLVMDIBuilderFinalizeSubprogram(self.di_builder, new_program);
 
-                DISubprogram::from_value_ref(LLVMMetadataAsValue(self.context, new_program))
+                DISubprogram::from_value_ref(LLVMMetadataAsValue(
+                    self.context.context_ref(),
+                    new_program,
+                ))
             };
 
             // Point the function to the new subprogram.
@@ -680,8 +716,9 @@ impl<'ctx> DISanitizer<'ctx> {
             // Remove retained nodes from the old program or we'll hit a debug assertion since
             // its debug variables no longer point to the program. See the
             // NumAbstractSubprograms assertion in DwarfDebug::endFunctionImpl in LLVM.
-            let empty_node =
-                unsafe { LLVMMDNodeInContext2(self.context, core::ptr::null_mut(), 0) };
+            let empty_node = unsafe {
+                LLVMMDNodeInContext2(self.context.context_ref(), core::ptr::null_mut(), 0)
+            };
             subprogram.set_retained_nodes(empty_node);
 
             let ret = replace.insert(subprogram.value_ref as u64, unsafe {

@@ -1,7 +1,6 @@
 mod di;
 mod intrinsic;
-mod iter;
-mod types;
+pub mod types;
 
 use std::{
     borrow::Cow,
@@ -12,7 +11,6 @@ use std::{
 };
 
 pub use di::DISanitizer;
-use iter::{IterModuleFunctions, IterModuleGlobalAliases, IterModuleGlobals};
 use libc::c_char as libc_char;
 use llvm_sys::{
     bit_reader::LLVMParseBitcodeInContext2,
@@ -50,6 +48,10 @@ use llvm_sys::{
     LLVMAttributeFunctionIndex, LLVMLinkage, LLVMVisibility,
 };
 use tracing::{debug, error};
+use types::{
+    ir::{Context, Module},
+    iter::{IterModuleFunctions, IterModuleGlobalAliases, IterModuleGlobals},
+};
 
 use crate::OptLevel;
 
@@ -86,7 +88,7 @@ pub unsafe fn create_module(name: &str, context: LLVMContextRef) -> Option<LLVMM
 }
 
 pub unsafe fn find_embedded_bitcode(
-    context: LLVMContextRef,
+    context: &mut Context,
     data: &[u8],
 ) -> Result<Option<Vec<u8>>, String> {
     let buffer_name = CString::new("mem_buffer").unwrap();
@@ -97,7 +99,8 @@ pub unsafe fn find_embedded_bitcode(
         0,
     );
 
-    let (bin, message) = Message::with(|message| LLVMCreateBinary(buffer, context, message));
+    let (bin, message) =
+        Message::with(|message| LLVMCreateBinary(buffer, context.context_ref(), message));
     if bin.is_null() {
         return Err(message.as_c_str().unwrap().to_str().unwrap().to_string());
     }
@@ -126,8 +129,8 @@ pub unsafe fn find_embedded_bitcode(
 
 #[must_use]
 pub unsafe fn link_bitcode_buffer(
-    context: LLVMContextRef,
-    module: LLVMModuleRef,
+    context: &mut Context,
+    module: &mut Module,
     buffer: &[u8],
 ) -> bool {
     let mut linked = false;
@@ -141,8 +144,8 @@ pub unsafe fn link_bitcode_buffer(
 
     let mut temp_module = ptr::null_mut();
 
-    if LLVMParseBitcodeInContext2(context, buffer, &mut temp_module) == 0 {
-        linked = LLVMLinkModules2(module, temp_module) == 0;
+    if LLVMParseBitcodeInContext2(context.context_ref(), buffer, &mut temp_module) == 0 {
+        linked = LLVMLinkModules2(module.module_ref(), temp_module) == 0;
     }
 
     LLVMDisposeMemoryBuffer(buffer);
@@ -161,8 +164,8 @@ pub unsafe fn target_from_triple(triple: &CStr) -> Result<LLVMTargetRef, String>
     }
 }
 
-pub unsafe fn target_from_module(module: LLVMModuleRef) -> Result<LLVMTargetRef, String> {
-    let triple = LLVMGetTarget(module);
+pub unsafe fn target_from_module(module: &Module) -> Result<LLVMTargetRef, String> {
+    let triple = LLVMGetTarget(module.module_ref());
     target_from_triple(CStr::from_ptr(triple))
 }
 
@@ -193,13 +196,13 @@ pub unsafe fn create_target_machine(
 
 pub unsafe fn optimize(
     tm: LLVMTargetMachineRef,
-    module: LLVMModuleRef,
+    module: &mut Module,
     opt_level: OptLevel,
     ignore_inline_never: bool,
     export_symbols: &HashSet<Cow<'static, str>>,
 ) -> Result<(), String> {
     if module_asm_is_probestack(module) {
-        LLVMSetModuleInlineAsm2(module, ptr::null_mut(), 0);
+        LLVMSetModuleInlineAsm2(module.module_ref(), ptr::null_mut(), 0);
     }
 
     for sym in module.globals_iter() {
@@ -240,7 +243,7 @@ pub unsafe fn optimize(
     debug!("running passes: {passes}");
     let passes = CString::new(passes).unwrap();
     let options = LLVMCreatePassBuilderOptions();
-    let error = LLVMRunPasses(module, passes.as_ptr(), tm, options);
+    let error = LLVMRunPasses(module.module_ref(), passes.as_ptr(), tm, options);
     LLVMDisposePassBuilderOptions(options);
     // Handle the error and print it to stderr.
     if !error.is_null() {
@@ -257,13 +260,13 @@ pub unsafe fn optimize(
 }
 
 /// strips debug information, returns true if DI got stripped
-pub unsafe fn strip_debug_info(module: LLVMModuleRef) -> bool {
-    LLVMStripModuleDebugInfo(module) != 0
+pub unsafe fn strip_debug_info(module: &mut Module) -> bool {
+    LLVMStripModuleDebugInfo(module.module_ref()) != 0
 }
 
-unsafe fn module_asm_is_probestack(module: LLVMModuleRef) -> bool {
+unsafe fn module_asm_is_probestack(module: &mut Module) -> bool {
     let mut len = 0;
-    let ptr = LLVMGetModuleInlineAsm(module, &mut len);
+    let ptr = LLVMGetModuleInlineAsm(module.module_ref(), &mut len);
     if ptr.is_null() {
         return false;
     }
@@ -283,9 +286,10 @@ unsafe fn remove_attribute(function: *mut llvm_sys::LLVMValue, name: &str) {
     LLVMRemoveEnumAttributeAtIndex(function, LLVMAttributeFunctionIndex, attr_kind);
 }
 
-pub unsafe fn write_ir(module: LLVMModuleRef, output: &CStr) -> Result<(), String> {
-    let (ret, message) =
-        Message::with(|message| LLVMPrintModuleToFile(module, output.as_ptr(), message));
+pub unsafe fn write_ir(module: &mut Module, output: &CStr) -> Result<(), String> {
+    let (ret, message) = Message::with(|message| {
+        LLVMPrintModuleToFile(module.module_ref(), output.as_ptr(), message)
+    });
     if ret == 0 {
         Ok(())
     } else {
@@ -295,12 +299,18 @@ pub unsafe fn write_ir(module: LLVMModuleRef, output: &CStr) -> Result<(), Strin
 
 pub unsafe fn codegen(
     tm: LLVMTargetMachineRef,
-    module: LLVMModuleRef,
+    module: &mut Module,
     output: &CStr,
     output_type: LLVMCodeGenFileType,
 ) -> Result<(), String> {
     let (ret, message) = Message::with(|message| {
-        LLVMTargetMachineEmitToFile(tm, module, output.as_ptr() as *mut _, output_type, message)
+        LLVMTargetMachineEmitToFile(
+            tm,
+            module.module_ref(),
+            output.as_ptr() as *mut _,
+            output_type,
+            message,
+        )
     });
     if ret == 0 {
         Ok(())
