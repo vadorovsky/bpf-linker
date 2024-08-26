@@ -15,6 +15,7 @@ use crate::{
         types::{
             di::{DISubprogram, DIType},
             ir::{Function, MDNode, Metadata, Value},
+            LLVMTypeWrapper,
         },
     },
     Linker,
@@ -211,7 +212,7 @@ impl Linker {
             // An operand with no value is valid and means that the operand is
             // not set
             (v, Item::Operand { .. }) if v.is_null() => return,
-            (v, _) if !v.is_null() => Value::new(v),
+            (v, _) if !v.is_null() => unsafe { Value::from_ptr(v) },
             // All other items should have values
             (_, item) => panic!("{item:?} has no value"),
         };
@@ -312,7 +313,7 @@ impl Linker {
         for mut function in self
             .module
             .functions_iter()
-            .map(|value| unsafe { Function::from_value_ref(value) })
+            .map(|value| unsafe { Function::from_ptr(value) })
         {
             if self.options.export_symbols.contains(function.name()) {
                 continue;
@@ -351,7 +352,7 @@ impl Linker {
                 // replace retained nodes manually below.
                 LLVMDIBuilderFinalizeSubprogram(self.di_builder, new_program);
 
-                DISubprogram::from_value_ref(LLVMMetadataAsValue(self.context, new_program))
+                DISubprogram::from_ptr(LLVMMetadataAsValue(self.context, new_program))
             };
 
             // Point the function to the new subprogram.
@@ -377,8 +378,8 @@ impl Linker {
                 unsafe { LLVMMDNodeInContext2(self.context, core::ptr::null_mut(), 0) };
             subprogram.set_retained_nodes(empty_node);
 
-            let ret = replace.insert(subprogram.value_ref as u64, unsafe {
-                LLVMValueAsMetadata(new_program.value_ref)
+            let ret = replace.insert(subprogram.as_ptr() as u64, unsafe {
+                LLVMValueAsMetadata(new_program.as_ptr())
             });
             assert!(ret.is_none());
         }
