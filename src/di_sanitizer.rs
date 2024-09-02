@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     ffi::c_char,
     hash::Hasher,
     ptr,
@@ -14,7 +14,7 @@ use crate::{
         iter::*,
         types::{
             di::{DISubprogram, DIType},
-            ir::{Function, MDNode, Metadata, Value},
+            ir::{Context, Function, Instruction, MDNode, Metadata, Value},
             LLVMTypeWrapper,
         },
     },
@@ -25,6 +25,13 @@ use crate::{
 // to lower value found accross kernel versions to ensure
 // backward compatibility
 const MAX_KSYM_NAME_LEN: usize = 128;
+
+#[derive(Default)]
+pub struct DISanitizer {
+    visited_nodes: HashSet<u64>,
+    replace_operands: HashMap<u64, LLVMMetadataRef>,
+    skipped_types: Vec<String>,
+}
 
 // Sanitize Rust type names to be valid C type names.
 fn sanitize_type_name<T: AsRef<str>>(name: T) -> String {
@@ -54,8 +61,8 @@ fn sanitize_type_name<T: AsRef<str>>(name: T) -> String {
     n
 }
 
-impl Linker {
-    fn visit_mdnode(&mut self, mdnode: MDNode) {
+impl DISanitizer {
+    fn visit_mdnode(&mut self, context: &Context, mdnode: MDNode) {
         match mdnode.try_into().expect("MDNode is not Metadata") {
             Metadata::DICompositeType(mut di_composite_type) => {
                 #[allow(clippy::single_match)]
@@ -153,22 +160,22 @@ impl Linker {
                             }
                         }
                         if is_data_carrying_enum {
-                            di_composite_type.replace_elements(MDNode::empty(self.context));
+                            di_composite_type.replace_elements(MDNode::empty(context));
                         } else if !members.is_empty() {
                             members.sort_by_cached_key(|di_type| di_type.offset_in_bits());
                             let sorted_elements =
-                                MDNode::with_elements(self.context, members.as_mut_slice());
+                                MDNode::with_elements(context, members.as_mut_slice());
                             di_composite_type.replace_elements(sorted_elements);
                         }
                         if remove_name {
                             // `AyaBtfMapMarker` is a type which is used in fields of BTF map
                             // structs. We need to make such structs anonymous in order to get
                             // BTF maps accepted by the Linux kernel.
-                            di_composite_type.replace_name(self.context, "").unwrap();
+                            di_composite_type.replace_name(context, "").unwrap();
                         } else if let Some((_, sanitized_name)) = names {
                             // Clear the name from characters incompatible with C.
                             di_composite_type
-                                .replace_name(self.context, sanitized_name.as_str())
+                                .replace_name(context, sanitized_name.as_str())
                                 .unwrap();
                         }
                     }
@@ -181,7 +188,7 @@ impl Linker {
                 match di_derived_type.tag() {
                     DW_TAG_pointer_type => {
                         // remove rust names
-                        di_derived_type.replace_name(self.context, "").unwrap();
+                        di_derived_type.replace_name(context, "").unwrap();
                     }
                     _ => (),
                 }
@@ -190,9 +197,7 @@ impl Linker {
                 // Sanitize function names
                 if let Some(name) = di_subprogram.name() {
                     let name = sanitize_type_name(name);
-                    di_subprogram
-                        .replace_name(self.context, name.as_str())
-                        .unwrap();
+                    di_subprogram.replace_name(context, name.as_str()).unwrap();
                 }
             }
             _ => (),
@@ -200,7 +205,7 @@ impl Linker {
     }
 
     // navigate the tree of LLVMValueRefs (DFS-pre-order)
-    fn visit_item(&mut self, mut item: Item) {
+    fn visit_item<'a>(&mut self, context: &Context, item: &mut Item<'a>) {
         let value_ref = item.value_ref();
         let value_id = item.value_id();
 
@@ -217,12 +222,12 @@ impl Linker {
             (_, item) => panic!("{item:?} has no value"),
         };
 
-        if let Item::Operand(operand) = &mut item {
+        if let Item::Operand(operand) = item {
             // When we have an operand to replace, we must do so regardless of whether we've already
             // seen its value or not, since the same value can appear as an operand in multiple
             // nodes in the tree.
             if let Some(new_metadata) = self.replace_operands.get(&value_id) {
-                operand.replace(unsafe { LLVMMetadataAsValue(self.context, *new_metadata) })
+                operand.replace(unsafe { LLVMMetadataAsValue(context.as_ptr(), *new_metadata) })
             }
         }
 
@@ -233,23 +238,29 @@ impl Linker {
         }
 
         if let Value::MDNode(mdnode) = value.clone() {
-            self.visit_mdnode(mdnode)
+            self.visit_mdnode(context, mdnode)
         }
 
         if let Some(operands) = value.operands() {
             for (index, operand) in operands.enumerate() {
-                self.visit_item(Item::Operand(Operand {
-                    parent: value_ref,
-                    value: operand,
-                    index: index as u32,
-                }))
+                self.visit_item(
+                    context,
+                    &mut Item::Operand(Operand {
+                        parent: value_ref,
+                        value: operand,
+                        index: index as u32,
+                    }),
+                )
             }
         }
 
         if let Some(entries) = value.metadata_entries() {
             for (index, (metadata, kind)) in entries.iter().enumerate() {
-                let metadata_value = unsafe { LLVMMetadataAsValue(self.context, metadata) };
-                self.visit_item(Item::MetadataEntry(metadata_value, kind, index));
+                let metadata_value = unsafe { LLVMMetadataAsValue(context.as_ptr(), metadata) };
+                self.visit_item(
+                    context,
+                    &mut Item::MetadataEntry(metadata_value, kind, index),
+                );
             }
         }
 
@@ -257,41 +268,40 @@ impl Linker {
         // those too.
         if let Value::Function(fun) = value {
             for param in fun.params() {
-                self.visit_item(Item::FunctionParam(param));
+                self.visit_item(context, &mut Item::FunctionParam(param));
             }
 
-            for basic_block in fun.basic_blocks() {
+            for basic_block in fun.basic_blocks_iter() {
                 for instruction in basic_block.instructions_iter() {
-                    self.visit_item(Item::Instruction(instruction));
+                    self.visit_item(context, &mut Item::Instruction(instruction));
                 }
             }
         }
     }
+}
 
+impl<'ctx> Linker<'ctx> {
     pub fn sanitize_di(&mut self) {
-        let module = self.module;
+        let mut di_sanitizer = DISanitizer::default();
+        di_sanitizer.replace_operands = self.fix_subprogram_linkage();
 
-        self.replace_operands = self.fix_subprogram_linkage();
-
-        for value in module.globals_iter() {
-            self.visit_item(Item::GlobalVariable(value));
+        for value in self.module.globals_iter() {
+            di_sanitizer.visit_item(&self.context, &mut Item::GlobalVariable(value.as_ptr()));
         }
-        for value in module.global_aliases_iter() {
-            self.visit_item(Item::GlobalAlias(value));
-        }
-
-        for function in module.functions_iter() {
-            self.visit_item(Item::Function(function));
+        for value in self.module.global_aliases_iter() {
+            di_sanitizer.visit_item(&self.context, &mut Item::GlobalAlias(value.as_ptr()));
         }
 
-        if !self.skipped_types.is_empty() {
+        for function in self.module.functions_iter() {
+            di_sanitizer.visit_item(&self.context, &mut Item::Function(function));
+        }
+
+        if !di_sanitizer.skipped_types.is_empty() {
             warn!(
                 "debug info was not emitted for the following types: {}",
-                self.skipped_types.join(", ")
+                di_sanitizer.skipped_types.join(", ")
             );
         }
-
-        unsafe { LLVMDisposeDIBuilder(self.di_builder) };
     }
 
     // Make it so that only exported symbols (programs marked as #[no_mangle]) get BTF
@@ -310,17 +320,15 @@ impl Linker {
     fn fix_subprogram_linkage(&mut self) -> HashMap<u64, LLVMMetadataRef> {
         let mut replace = HashMap::new();
 
-        for mut function in self
-            .module
-            .functions_iter()
-            .map(|value| unsafe { Function::from_ptr(value) })
-        {
+        let di_builder = self.module.create_di_builder();
+
+        for mut function in self.module.functions_iter() {
             if self.options.export_symbols.contains(function.name()) {
                 continue;
             }
 
             // Skip functions that don't have subprograms.
-            let Some(mut subprogram) = function.subprogram(self.context) else {
+            let Some(mut subprogram) = function.subprogram(&self.context) else {
                 continue;
             };
 
@@ -332,7 +340,7 @@ impl Linker {
             // with linkage=static
             let mut new_program = unsafe {
                 let new_program = LLVMDIBuilderCreateFunction(
-                    self.di_builder,
+                    di_builder.as_ptr(),
                     subprogram.scope().unwrap(),
                     name.as_ptr() as *const c_char,
                     name.len(),
@@ -350,9 +358,9 @@ impl Linker {
                 // Technically this must be called as part of the builder API, but effectively does
                 // nothing because we don't add any variables through the builder API, instead we
                 // replace retained nodes manually below.
-                LLVMDIBuilderFinalizeSubprogram(self.di_builder, new_program);
+                LLVMDIBuilderFinalizeSubprogram(di_builder.as_ptr(), new_program);
 
-                DISubprogram::from_ptr(LLVMMetadataAsValue(self.context, new_program))
+                DISubprogram::from_ptr(LLVMMetadataAsValue(self.context.as_ptr(), new_program))
             };
 
             // Point the function to the new subprogram.
@@ -375,7 +383,7 @@ impl Linker {
             // its debug variables no longer point to the program. See the
             // NumAbstractSubprograms assertion in DwarfDebug::endFunctionImpl in LLVM.
             let empty_node =
-                unsafe { LLVMMDNodeInContext2(self.context, core::ptr::null_mut(), 0) };
+                unsafe { LLVMMDNodeInContext2(self.context.as_ptr(), core::ptr::null_mut(), 0) };
             subprogram.set_retained_nodes(empty_node);
 
             let ret = replace.insert(subprogram.as_ptr() as u64, unsafe {
@@ -388,13 +396,14 @@ impl Linker {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Item {
+// #[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
+pub(crate) enum Item<'ctx> {
     GlobalVariable(LLVMValueRef),
     GlobalAlias(LLVMValueRef),
-    Function(LLVMValueRef),
+    Function(Function<'ctx>),
     FunctionParam(LLVMValueRef),
-    Instruction(LLVMValueRef),
+    Instruction(Instruction<'ctx>),
     Operand(Operand),
     MetadataEntry(LLVMValueRef, u32, usize),
 }
@@ -419,16 +428,16 @@ impl Operand {
     }
 }
 
-impl Item {
+impl<'ctx> Item<'ctx> {
     fn value_ref(&self) -> LLVMValueRef {
         match self {
             Item::GlobalVariable(value)
             | Item::GlobalAlias(value)
-            | Item::Function(value)
             | Item::FunctionParam(value)
-            | Item::Instruction(value)
             | Item::Operand(Operand { value, .. })
             | Item::MetadataEntry(value, _, _) => *value,
+            Item::Function(f) => f.as_ptr(),
+            Item::Instruction(instruction) => instruction.as_ptr(),
         }
     }
 

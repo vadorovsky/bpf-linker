@@ -3,6 +3,6 @@
 
 mod di_sanitizer;
 mod linker;
-mod llvm;
+pub mod llvm;
 
 pub use linker::*;
