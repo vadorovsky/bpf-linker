@@ -29,6 +29,8 @@ use crate::llvm::{
     Message,
 };
 
+use super::LLVMTypeError;
+
 pub(crate) fn replace_name(
     value_ref: LLVMValueRef,
     context: LLVMContextRef,
@@ -80,14 +82,14 @@ impl<'ctx> std::fmt::Debug for Value<'ctx> {
 impl<'ctx> LLVMTypeWrapper for Value<'ctx> {
     type Target = LLVMValueRef;
 
-    unsafe fn from_ptr(value_ref: Self::Target) -> Self {
+    fn try_from_ptr(value_ref: Self::Target) -> Result<Self, LLVMTypeError> {
         if unsafe { !LLVMIsAMDNode(value_ref).is_null() } {
-            let mdnode = unsafe { MDNode::from_ptr(value_ref) };
-            return Value::MDNode(mdnode);
+            let mdnode = MDNode::try_from_ptr(value_ref)?;
+            return Ok(Value::MDNode(mdnode));
         } else if unsafe { !LLVMIsAFunction(value_ref).is_null() } {
-            return Value::Function(unsafe { Function::from_ptr(value_ref) });
+            return Ok(Value::Function(Function::try_from_ptr(value_ref)?));
         }
-        Value::Other(value_ref)
+        Ok(Value::Other(value_ref))
     }
 
     fn as_ptr(&self) -> Self::Target {
@@ -130,30 +132,27 @@ pub enum Metadata<'ctx> {
     Other(#[allow(dead_code)] LLVMValueRef),
 }
 
-impl<'ctx> Metadata<'ctx> {
-    /// Constructs a new [`Metadata`] from the given `value`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the provided `value` corresponds to a valid
-    /// instance of [LLVM `Metadata`](https://llvm.org/doxygen/classllvm_1_1Metadata.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any valiation checks.
-    pub(crate) unsafe fn from_value_ref(value: LLVMValueRef) -> Self {
-        let metadata = LLVMValueAsMetadata(value);
+impl<'ctx> LLVMTypeWrapper for Metadata<'ctx> {
+    type Target = LLVMValueRef;
+
+    fn try_from_ptr(value: Self::Target) -> Result<Self, LLVMTypeError>
+    where
+        Self: Sized,
+    {
+        let metadata = unsafe { LLVMValueAsMetadata(value) };
 
         match unsafe { LLVMGetMetadataKind(metadata) } {
             LLVMMetadataKind::LLVMDICompositeTypeMetadataKind => {
-                let di_composite_type = unsafe { DICompositeType::from_ptr(value) };
-                Metadata::DICompositeType(di_composite_type)
+                let di_composite_type = DICompositeType::try_from_ptr(value)?;
+                Ok(Metadata::DICompositeType(di_composite_type))
             }
             LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind => {
-                let di_derived_type = unsafe { DIDerivedType::from_ptr(value) };
-                Metadata::DIDerivedType(di_derived_type)
+                let di_derived_type = DIDerivedType::try_from_ptr(value)?;
+                Ok(Metadata::DIDerivedType(di_derived_type))
             }
             LLVMMetadataKind::LLVMDISubprogramMetadataKind => {
-                let di_subprogram = unsafe { DISubprogram::from_ptr(value) };
-                Metadata::DISubprogram(di_subprogram)
+                let di_subprogram = DISubprogram::try_from_ptr(value)?;
+                Ok(Metadata::DISubprogram(di_subprogram))
             }
             LLVMMetadataKind::LLVMDIGlobalVariableMetadataKind
             | LLVMMetadataKind::LLVMDICommonBlockMetadataKind
@@ -187,17 +186,26 @@ impl<'ctx> Metadata<'ctx> {
             | LLVMMetadataKind::LLVMDIStringTypeMetadataKind
             | LLVMMetadataKind::LLVMDIGenericSubrangeMetadataKind
             | LLVMMetadataKind::LLVMDIArgListMetadataKind
-            | LLVMMetadataKind::LLVMDIAssignIDMetadataKind => Metadata::Other(value),
+            | LLVMMetadataKind::LLVMDIAssignIDMetadataKind => Ok(Metadata::Other(value)),
+        }
+    }
+
+    fn as_ptr(&self) -> Self::Target {
+        match self {
+            Metadata::DICompositeType(di_composite_type) => di_composite_type.as_ptr(),
+            Metadata::DIDerivedType(di_derived_type) => di_derived_type.as_ptr(),
+            Metadata::DISubprogram(di_subprogram) => di_subprogram.as_ptr(),
+            Metadata::Other(value) => *value,
         }
     }
 }
 
 impl<'ctx> TryFrom<MDNode<'ctx>> for Metadata<'ctx> {
-    type Error = ();
+    type Error = LLVMTypeError;
 
     fn try_from(md_node: MDNode) -> Result<Self, Self::Error> {
         // FIXME: fail if md_node isn't a Metadata node
-        Ok(unsafe { Self::from_value_ref(md_node.value_ref) })
+        Ok(Self::try_from_ptr(md_node.value_ref)?)
     }
 }
 
@@ -211,19 +219,14 @@ pub struct MDNode<'ctx> {
 impl<'ctx> LLVMTypeWrapper for MDNode<'ctx> {
     type Target = LLVMValueRef;
 
-    /// Constructs a new [`MDNode`] from the given `value`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the provided `value` corresponds to a valid
-    /// instance of [LLVM `MDNode`](https://llvm.org/doxygen/classllvm_1_1MDNode.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any valiation checks.
-    unsafe fn from_ptr(value_ref: Self::Target) -> Self {
-        Self {
+    fn try_from_ptr(value_ref: Self::Target) -> Result<Self, LLVMTypeError>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
             value_ref,
             _marker: PhantomData,
-        }
+        })
     }
 
     fn as_ptr(&self) -> Self::Target {
@@ -240,11 +243,11 @@ impl<'ctx> MDNode<'ctx> {
     /// instance of [LLVM `MDNode`](https://llvm.org/doxygen/classllvm_1_1MDNode.html).
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any validation checks.
-    pub(crate) unsafe fn from_metadata_ref(
+    pub(crate) fn from_metadata_ref(
         context: LLVMContextRef,
         metadata: LLVMMetadataRef,
-    ) -> Self {
-        MDNode::from_ptr(LLVMMetadataAsValue(context, metadata))
+    ) -> Result<Self, LLVMTypeError> {
+        MDNode::try_from_ptr(unsafe { LLVMMetadataAsValue(context, metadata) })
     }
 
     /// Constructs an empty metadata node.
@@ -258,7 +261,8 @@ impl<'ctx> MDNode<'ctx> {
     /// method doesn't perform any valiation checks.
     pub fn empty(context: LLVMContextRef) -> Self {
         let metadata = unsafe { LLVMMDNodeInContext2(context, core::ptr::null_mut(), 0) };
-        unsafe { Self::from_metadata_ref(context, metadata) }
+        // PANICS: We are sure about correctness of this pointer.
+        Self::from_metadata_ref(context, metadata).unwrap()
     }
 
     /// Constructs a new metadata node from an array of [`DIType`] elements.
@@ -278,7 +282,8 @@ impl<'ctx> MDNode<'ctx> {
                 elements.len(),
             )
         };
-        unsafe { Self::from_metadata_ref(context, metadata) }
+        // PANICS: We are sure about correctness of this pointer.
+        Self::from_metadata_ref(context, metadata).unwrap()
     }
 }
 
@@ -330,19 +335,14 @@ pub struct Function<'ctx> {
 impl<'ctx> LLVMTypeWrapper for Function<'ctx> {
     type Target = LLVMValueRef;
 
-    /// Constructs a new [`Function`] from the given `value`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the provided `value` corresponds to a valid
-    /// instance of [LLVM `Function`](https://llvm.org/doxygen/classllvm_1_1Function.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any valiation checks.
-    unsafe fn from_ptr(value_ref: Self::Target) -> Self {
-        Self {
+    fn try_from_ptr(value_ref: Self::Target) -> Result<Self, LLVMTypeError>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
             value_ref,
             _marker: PhantomData,
-        }
+        })
     }
 
     fn as_ptr(&self) -> Self::Target {
@@ -367,8 +367,10 @@ impl<'ctx> Function<'ctx> {
 
     pub(crate) fn subprogram(&self, context: LLVMContextRef) -> Option<DISubprogram<'ctx>> {
         let subprogram = unsafe { LLVMGetSubprogram(self.value_ref) };
-        NonNull::new(subprogram)
-            .map(|_| unsafe { DISubprogram::from_ptr(LLVMMetadataAsValue(context, subprogram)) })
+        NonNull::new(subprogram).map(|_| {
+            // PANICS: We are sure about correctness of this pointer.
+            DISubprogram::try_from_ptr(unsafe { LLVMMetadataAsValue(context, subprogram) }).unwrap()
+        })
     }
 
     pub(crate) fn set_subprogram(&mut self, subprogram: &DISubprogram) {

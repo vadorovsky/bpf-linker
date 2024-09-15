@@ -7,11 +7,14 @@ use std::{
 
 use gimli::DwTag;
 use llvm_sys::{
-    core::{LLVMGetNumOperands, LLVMGetOperand, LLVMReplaceMDNodeOperandWith, LLVMValueAsMetadata},
+    core::{
+        LLVMGetNumOperands, LLVMGetOperand, LLVMIsAMDNode, LLVMReplaceMDNodeOperandWith,
+        LLVMValueAsMetadata,
+    },
     debuginfo::{
         LLVMDIFileGetFilename, LLVMDIFlags, LLVMDIScopeGetFile, LLVMDISubprogramGetLine,
         LLVMDITypeGetFlags, LLVMDITypeGetLine, LLVMDITypeGetName, LLVMDITypeGetOffsetInBits,
-        LLVMGetDINodeTag,
+        LLVMGetDINodeTag, LLVMGetMetadataKind, LLVMMetadataKind,
     },
     prelude::{LLVMContextRef, LLVMMetadataRef, LLVMValueRef},
 };
@@ -23,6 +26,8 @@ use crate::llvm::{
         LLVMTypeWrapper,
     },
 };
+
+use super::LLVMTypeError;
 
 /// Returns a DWARF tag for the given debug info node.
 ///
@@ -51,18 +56,16 @@ pub struct DIFile<'ctx> {
 impl<'ctx> LLVMTypeWrapper for DIFile<'ctx> {
     type Target = LLVMMetadataRef;
 
-    /// Constructs a new [`DIFile`] from the given `metadata`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the given `metadata` corresponds to a valid
-    /// instance of [LLVM `DIFile`](https://llvm.org/doxygen/classllvm_1_1DIFile.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any validation checks.
-    unsafe fn from_ptr(metadata_ref: Self::Target) -> Self {
-        Self {
-            metadata_ref,
-            _marker: PhantomData,
+    fn try_from_ptr(metadata_ref: Self::Target) -> Result<Self, LLVMTypeError> {
+        if metadata_ref.is_null() {
+            return Err(LLVMTypeError::NullPointer);
+        }
+        match unsafe { LLVMGetMetadataKind(metadata_ref) } {
+            LLVMMetadataKind::LLVMDIFileMetadataKind => Ok(Self {
+                metadata_ref,
+                _marker: PhantomData,
+            }),
+            _ => Err(LLVMTypeError::InvalidPointerType),
         }
     }
 
@@ -128,21 +131,13 @@ pub struct DIType<'ctx> {
 impl<'ctx> LLVMTypeWrapper for DIType<'ctx> {
     type Target = LLVMValueRef;
 
-    /// Constructs a new [`DIType`] from the given `value`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the given `value` corresponds to a valid
-    /// instance of [LLVM `DIType`](https://llvm.org/doxygen/classllvm_1_1DIType.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any validation checks.
-    unsafe fn from_ptr(value_ref: Self::Target) -> Self {
+    fn try_from_ptr(value_ref: Self::Target) -> Result<Self, LLVMTypeError> {
         let metadata_ref = unsafe { LLVMValueAsMetadata(value_ref) };
-        Self {
+        Ok(Self {
             metadata_ref,
             value_ref,
             _marker: PhantomData,
-        }
+        })
     }
 
     fn as_ptr(&self) -> Self::Target {
@@ -158,9 +153,11 @@ impl<'ctx> DIType<'ctx> {
     }
 }
 
-impl<'ctx> From<DIDerivedType<'ctx>> for DIType<'ctx> {
-    fn from(di_derived_type: DIDerivedType) -> Self {
-        unsafe { Self::from_ptr(di_derived_type.value_ref) }
+impl<'ctx> TryFrom<DIDerivedType<'ctx>> for DIType<'ctx> {
+    type Error = LLVMTypeError;
+
+    fn try_from(di_derived_type: DIDerivedType) -> Result<Self, Self::Error> {
+        Ok(Self::try_from_ptr(di_derived_type.value_ref)?)
     }
 }
 
@@ -187,21 +184,13 @@ pub struct DIDerivedType<'ctx> {
 impl<'ctx> LLVMTypeWrapper for DIDerivedType<'ctx> {
     type Target = LLVMValueRef;
 
-    /// Constructs a new [`DIDerivedType`] from the given `value`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the provided `value` corresponds to a valid
-    /// instance of [LLVM `DIDerivedType`](https://llvm.org/doxygen/classllvm_1_1DIDerivedType.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any validation checks.
-    unsafe fn from_ptr(value_ref: Self::Target) -> Self {
-        let metadata_ref = LLVMValueAsMetadata(value_ref);
-        Self {
+    fn try_from_ptr(value_ref: Self::Target) -> Result<Self, LLVMTypeError> {
+        let metadata_ref = unsafe { LLVMValueAsMetadata(value_ref) };
+        Ok(Self {
             metadata_ref,
             value_ref,
             _marker: PhantomData,
-        }
+        })
     }
 
     fn as_ptr(&self) -> Self::Target {
@@ -214,7 +203,8 @@ impl<'ctx> DIDerivedType<'ctx> {
     pub fn base_type(&self) -> Metadata {
         unsafe {
             let value = LLVMGetOperand(self.value_ref, DIDerivedTypeOperand::BaseType as u32);
-            Metadata::from_value_ref(value)
+            // PANICS: We are sure about correctness of the pointer.
+            Metadata::try_from_ptr(value).unwrap()
         }
     }
 
@@ -256,21 +246,13 @@ pub struct DICompositeType<'ctx> {
 impl<'ctx> LLVMTypeWrapper for DICompositeType<'ctx> {
     type Target = LLVMValueRef;
 
-    /// Constructs a new [`DICompositeType`] from the given `value`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the provided `value` corresponds to a valid
-    /// instance of [LLVM `DICompositeType`](https://llvm.org/doxygen/classllvm_1_1DICompositeType.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any validation checks.
-    unsafe fn from_ptr(value_ref: Self::Target) -> Self {
-        let metadata_ref = LLVMValueAsMetadata(value_ref);
-        Self {
+    fn try_from_ptr(value_ref: Self::Target) -> Result<Self, LLVMTypeError> {
+        let metadata_ref = unsafe { LLVMValueAsMetadata(value_ref) };
+        Ok(Self {
             metadata_ref,
             value_ref,
             _marker: PhantomData,
-        }
+        })
     }
 
     fn as_ptr(&self) -> Self::Target {
@@ -288,8 +270,10 @@ impl<'ctx> DICompositeType<'ctx> {
             .map(|elements| unsafe { LLVMGetNumOperands(elements.as_ptr()) })
             .unwrap_or(0);
 
-        (0..operands)
-            .map(move |i| unsafe { Metadata::from_value_ref(LLVMGetOperand(elements, i as u32)) })
+        (0..operands).map(move |i| unsafe {
+            // PANIC: We are sure about correctness of the pointer.
+            Metadata::try_from_ptr(LLVMGetOperand(elements, i as u32)).unwrap()
+        })
     }
 
     /// Returns the name of the composite type.
@@ -301,7 +285,8 @@ impl<'ctx> DICompositeType<'ctx> {
     pub fn file(&self) -> DIFile {
         unsafe {
             let metadata = LLVMDIScopeGetFile(self.metadata_ref);
-            DIFile::from_ptr(metadata)
+            // PANICS: We are sure about the correctness of this pointer.
+            DIFile::try_from_ptr(metadata).unwrap()
         }
     }
 
@@ -366,19 +351,11 @@ pub struct DISubprogram<'ctx> {
 impl<'ctx> LLVMTypeWrapper for DISubprogram<'ctx> {
     type Target = LLVMValueRef;
 
-    /// Constructs a new [`DISubprogram`] from the given `value`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the provided `value` corresponds to a valid
-    /// instance of [LLVM `DISubprogram`](https://llvm.org/doxygen/classllvm_1_1DISubprogram.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any validation checks.
-    unsafe fn from_ptr(value_ref: Self::Target) -> Self {
-        DISubprogram {
+    fn try_from_ptr(value_ref: Self::Target) -> Result<Self, LLVMTypeError> {
+        Ok(DISubprogram {
             value_ref,
             _marker: PhantomData,
-        }
+        })
     }
 
     fn as_ptr(&self) -> Self::Target {

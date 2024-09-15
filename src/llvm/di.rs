@@ -15,7 +15,7 @@ use crate::llvm::{
     types::{
         di::{DISubprogram, DIType},
         ir::{Function, MDNode, Metadata, Value},
-        LLVMTypeWrapper,
+        LLVMTypeError, LLVMTypeWrapper,
     },
 };
 
@@ -73,7 +73,7 @@ impl DISanitizer {
         }
     }
 
-    fn visit_mdnode(&mut self, mdnode: MDNode) {
+    fn visit_mdnode(&mut self, mdnode: MDNode) -> Result<(), LLVMTypeError> {
         match mdnode.try_into().expect("MDNode is not Metadata") {
             Metadata::DICompositeType(mut di_composite_type) => {
                 #[allow(clippy::single_match)]
@@ -94,7 +94,7 @@ impl DISanitizer {
                         // anything on the declaration, we're going to process
                         // the actual definition.
                         if di_composite_type.flags() == LLVMDIFlagFwdDecl {
-                            return;
+                            return Ok(());
                         }
 
                         let mut is_data_carrying_enum = false;
@@ -156,14 +156,14 @@ impl DISanitizer {
                                                     remove_name = true;
                                                     // And don't include the field in the sanitized DI.
                                                 } else {
-                                                    members.push(di_derived_type.into());
+                                                    members.push(di_derived_type.try_into()?);
                                                 }
                                             } else {
-                                                members.push(di_derived_type.into());
+                                                members.push(di_derived_type.try_into()?);
                                             }
                                         }
                                         _ => {
-                                            members.push(di_derived_type.into());
+                                            members.push(di_derived_type.try_into()?);
                                         }
                                     }
                                 }
@@ -215,10 +215,12 @@ impl DISanitizer {
             }
             _ => (),
         }
+
+        Ok(())
     }
 
     // navigate the tree of LLVMValueRefs (DFS-pre-order)
-    fn visit_item(&mut self, mut item: Item) {
+    fn visit_item(&mut self, mut item: Item) -> Result<(), LLVMTypeError> {
         let value_ref = item.value_ref();
         let value_id = item.value_id();
 
@@ -229,8 +231,8 @@ impl DISanitizer {
         let value = match (value_ref, &item) {
             // An operand with no value is valid and means that the operand is
             // not set
-            (v, Item::Operand { .. }) if v.is_null() => return,
-            (v, _) if !v.is_null() => unsafe { Value::from_ptr(v) },
+            (v, Item::Operand { .. }) if v.is_null() => return Ok(()),
+            (v, _) if !v.is_null() => Value::try_from_ptr(v).unwrap(),
             // All other items should have values
             (_, item) => panic!("{item:?} has no value"),
         };
@@ -247,11 +249,11 @@ impl DISanitizer {
         let first_visit = self.visited_nodes.insert(value_id);
         if !first_visit {
             trace!("already visited");
-            return;
+            return Ok(());
         }
 
         if let Value::MDNode(mdnode) = value.clone() {
-            self.visit_mdnode(mdnode)
+            self.visit_mdnode(mdnode)?
         }
 
         if let Some(operands) = value.operands() {
@@ -260,14 +262,14 @@ impl DISanitizer {
                     parent: value_ref,
                     value: operand,
                     index: index as u32,
-                }))
+                }))?
             }
         }
 
         if let Some(entries) = value.metadata_entries() {
             for (index, (metadata, kind)) in entries.iter().enumerate() {
                 let metadata_value = unsafe { LLVMMetadataAsValue(self.context, metadata) };
-                self.visit_item(Item::MetadataEntry(metadata_value, kind, index));
+                self.visit_item(Item::MetadataEntry(metadata_value, kind, index))?;
             }
         }
 
@@ -275,31 +277,36 @@ impl DISanitizer {
         // those too.
         if let Value::Function(fun) = value {
             for param in fun.params() {
-                self.visit_item(Item::FunctionParam(param));
+                self.visit_item(Item::FunctionParam(param))?;
             }
 
             for basic_block in fun.basic_blocks() {
                 for instruction in basic_block.instructions_iter() {
-                    self.visit_item(Item::Instruction(instruction));
+                    self.visit_item(Item::Instruction(instruction))?;
                 }
             }
         }
+
+        Ok(())
     }
 
-    pub fn run(mut self, exported_symbols: &HashSet<Cow<'static, str>>) {
+    pub fn run(
+        mut self,
+        exported_symbols: &HashSet<Cow<'static, str>>,
+    ) -> Result<(), LLVMTypeError> {
         let module = self.module;
 
-        self.replace_operands = self.fix_subprogram_linkage(exported_symbols);
+        self.replace_operands = self.fix_subprogram_linkage(exported_symbols)?;
 
         for value in module.globals_iter() {
-            self.visit_item(Item::GlobalVariable(value));
+            self.visit_item(Item::GlobalVariable(value))?;
         }
         for value in module.global_aliases_iter() {
-            self.visit_item(Item::GlobalAlias(value));
+            self.visit_item(Item::GlobalAlias(value))?;
         }
 
         for function in module.functions_iter() {
-            self.visit_item(Item::Function(function));
+            self.visit_item(Item::Function(function))?;
         }
 
         if !self.skipped_types.is_empty() {
@@ -310,6 +317,8 @@ impl DISanitizer {
         }
 
         unsafe { LLVMDisposeDIBuilder(self.builder) };
+
+        Ok(())
     }
 
     // Make it so that only exported symbols (programs marked as #[no_mangle]) get BTF
@@ -328,14 +337,12 @@ impl DISanitizer {
     fn fix_subprogram_linkage(
         &mut self,
         export_symbols: &HashSet<Cow<'static, str>>,
-    ) -> HashMap<u64, LLVMMetadataRef> {
+    ) -> Result<HashMap<u64, LLVMMetadataRef>, LLVMTypeError> {
         let mut replace = HashMap::new();
 
-        for mut function in self
-            .module
-            .functions_iter()
-            .map(|value| unsafe { Function::from_ptr(value) })
-        {
+        for value in self.module.functions_iter() {
+            let mut function = Function::try_from_ptr(value)?;
+
             if export_symbols.contains(function.name()) {
                 continue;
             }
@@ -373,7 +380,7 @@ impl DISanitizer {
                 // replace retained nodes manually below.
                 LLVMDIBuilderFinalizeSubprogram(self.builder, new_program);
 
-                DISubprogram::from_ptr(LLVMMetadataAsValue(self.context, new_program))
+                DISubprogram::try_from_ptr(LLVMMetadataAsValue(self.context, new_program))?
             };
 
             // Point the function to the new subprogram.
@@ -405,7 +412,7 @@ impl DISanitizer {
             assert!(ret.is_none());
         }
 
-        replace
+        Ok(replace)
     }
 }
 
