@@ -3,13 +3,38 @@ name: LLVM
 on:
   workflow_call:
     outputs:
-      cache-key:
-        value: ${{ jobs.llvm.outputs.cache-key }}
+      cache-key-aarch64-linux-gnu:
+        value: ${{ jobs.llvm-linux.outputs.cache-key-aarch64-linux-gnu }}
+      cache-key-riscv64-linux-gnu:
+        value: ${{ jobs.llvm-linux.outputs.cache-key-riscv64-linux-gnu }}
+      cache-key-x86_64-linux-gnu:
+        value: ${{ jobs.llvm-linux.outputs.cache-key-x86_64-linux-gnu }}
 
 jobs:
   llvm:
     runs-on: ubuntu-22.04
-    name: llvm
+    strategy:
+      matrix:
+        include:
+          - os: macos-13
+            processor: arm64
+            target: aarch64-apple-darwin
+          - os: macos-13
+            processor: x86_64
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            packages: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
+            processor: aarch64
+            target: aarch64-linux-gnu
+          - os: ubuntu-22.04
+            packages: gcc-riscv64-linux-gnu g++-riscv64-linux-gnu libc6-dev-riscv64-cross
+            processor: riscv64
+            target: riscv64-linux-gnu
+          - os: ubuntu-22.04
+            packages:
+            processor: x86_64
+            target: x86_64-linux-gnu
+    name: llvm ${{ matrix.target }}
     outputs:
       cache-key: ${{ steps.cache-key.outputs.cache-key }}
     steps:
@@ -20,18 +45,18 @@ jobs:
           echo "sha=$value" >> "$GITHUB_OUTPUT"
 
       - id: cache-key
-        run: echo "cache-key=llvm-${{ steps.ls-remote.outputs.sha }}-1" >> "$GITHUB_OUTPUT"
+        run: echo "cache-key-${{ matrix.target }}=llvm-${{ matrix.target }}-${{ steps.ls-remote.outputs.sha }}-1" >> "$GITHUB_OUTPUT"
 
       - name: Cache
         id: cache-llvm
         uses: actions/cache@v4
         with:
           path: llvm-install
-          key: ${{ steps.cache-key.outputs.cache-key }}
+          key: ${{ steps.cache-key.outputs[format('cache-key-{0}', matrix.target)] }}
           lookup-only: true
 
       - name: Install Tools
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        if: runner.os == 'Linux' && steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | \
@@ -41,7 +66,22 @@ jobs:
             sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
 
           sudo apt update
-          sudo apt -y install cmake ninja-build clang lld
+          sudo apt -y install \
+            clang \
+            cmake \
+            lld \
+            ninja-build \
+            ${{ matrix.packages }}
+
+      # - name: Install Tools
+      #   if: runner.os == 'macOS' && steps.cache-llvm.outputs.cache-hit != 'true'
+      #   # Cross-compilation to Apple Sillicon with clang shipped on macOS doesn't
+      #   # work, use LLVM from brew.
+      #   run: |
+      #     set -euxo pipefail
+      #     brew update
+      #     brew install llvm
+      #     echo $(brew --prefix)/opt/llvm/bin >> $GITHUB_PATH
 
       - name: Checkout LLVM Source
         if: steps.cache-llvm.outputs.cache-hit != 'true'
@@ -60,42 +100,23 @@ jobs:
             -B llvm-build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_ASM_COMPILER=clang \
+            -DCMAKE_ASM_COMPILER_TARGET="${{ matrix.target }}" \
             -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_C_COMPILER_TARGET="${{ matrix.target }}" \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_COMPILER_TARGET="${{ matrix.target }}" \
             -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/llvm-install" \
-            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DCMAKE_SYSTEM_NAME="${{ matrix.system }}" \
+            -DCMAKE_SYSTEM_PROCESSOR="${{ matrix.processor }}" \
             -DLLVM_ENABLE_ASSERTIONS=ON \
             -DLLVM_ENABLE_PROJECTS= \
             -DLLVM_ENABLE_RUNTIMES= \
+            -DLLVM_HOST_TRIPLE="${{ matrix.target }}" \
             -DLLVM_INSTALL_UTILS=ON \
-            -DLLVM_LINK_LLVM_DYLIB=ON \
             -DLLVM_TARGETS_TO_BUILD=BPF \
             -DLLVM_USE_LINKER=lld
 
       - name: Install LLVM
         if: steps.cache-llvm.outputs.cache-hit != 'true'
-        env:
-          # Create symlinks rather than copies to conserve disk space. At the time of this writing,
-          # GitHub-hosted runners have 14GB of SSD space
-          # (https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources).
-          #
-          # Since the LLVM build creates a bunch of symlinks (and this setting does not turn those
-          # into symlinks-to-symlinks), use absolute symlinks so we can distinguish the two cases.
-          CMAKE_INSTALL_MODE: ABS_SYMLINK
         run: cmake --build llvm-build --target install
-
-      - name: Rewrite LLVM Symlinks
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
-        # Move targets over the symlinks that point to them.
-        #
-        # This whole dance would be simpler if CMake supported CMAKE_INSTALL_MODE=MOVE.
-        run: |
-          set -euxo pipefail
-          find llvm-install -type l -execdir sh -eux -c '
-            for link in "$@"; do
-              target=$(readlink "$link")
-              case $target in
-                /*) mv "$target" "$link" ;;
-              esac
-            done
-          ' sh {} +
