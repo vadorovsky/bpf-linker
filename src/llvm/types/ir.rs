@@ -21,8 +21,8 @@ use llvm_sys::{
         LLVMSetSubprogram, LLVMStripModuleDebugInfo,
     },
     prelude::{
-        LLVMBasicBlockRef, LLVMContextRef, LLVMMetadataRef, LLVMModuleRef, LLVMValueMetadataEntry,
-        LLVMValueRef,
+        LLVMBasicBlockRef, LLVMContextRef, LLVMDbgRecordRef, LLVMMetadataRef, LLVMModuleRef,
+        LLVMValueMetadataEntry, LLVMValueRef,
     },
 };
 
@@ -571,5 +571,26 @@ impl<'ctx> LLVMTypeWrapper for Instruction<'ctx> {
 
     fn as_ptr(&self) -> Self::Target {
         self.value_ref
+    }
+}
+
+#[derive(Clone)]
+pub struct DbgRecord<'ctx> {
+    dbg_record_ref: LLVMDbgRecordRef,
+    _marker: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> LLVMTypeWrapper for DbgRecord<'ctx> {
+    type Target = LLVMDbgRecordRef;
+
+    unsafe fn from_ptr(dbg_record_ref: Self::Target) -> Self {
+        Self {
+            dbg_record_ref,
+            _marker: PhantomData,
+        }
+    }
+
+    fn as_ptr(&self) -> Self::Target {
+        self.dbg_record_ref
     }
 }

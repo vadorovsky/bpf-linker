@@ -2,15 +2,18 @@ use std::marker::PhantomData;
 
 use llvm_sys::{
     core::{
-        LLVMGetFirstBasicBlock, LLVMGetFirstFunction, LLVMGetFirstGlobal, LLVMGetFirstGlobalAlias,
-        LLVMGetFirstInstruction, LLVMGetLastBasicBlock, LLVMGetLastFunction, LLVMGetLastGlobal,
-        LLVMGetLastGlobalAlias, LLVMGetLastInstruction, LLVMGetNextBasicBlock, LLVMGetNextFunction,
+        LLVMGetFirstBasicBlock, LLVMGetFirstDbgRecord, LLVMGetFirstFunction, LLVMGetFirstGlobal,
+        LLVMGetFirstGlobalAlias, LLVMGetFirstInstruction, LLVMGetLastBasicBlock,
+        LLVMGetLastDbgRecord, LLVMGetLastFunction, LLVMGetLastGlobal, LLVMGetLastGlobalAlias,
+        LLVMGetLastInstruction, LLVMGetNextBasicBlock, LLVMGetNextDbgRecord, LLVMGetNextFunction,
         LLVMGetNextGlobal, LLVMGetNextGlobalAlias, LLVMGetNextInstruction,
     },
-    prelude::{LLVMBasicBlockRef, LLVMValueRef},
+    prelude::{LLVMBasicBlockRef, LLVMDbgRecordRef, LLVMValueRef},
 };
 
 use crate::llvm::types::ir::{BasicBlock, Function, Instruction, Module, Value};
+
+use super::types::ir::DbgRecord;
 
 macro_rules! llvm_iterator {
     (
@@ -150,4 +153,17 @@ llvm_iterator!(
     LLVMGetFirstInstruction,
     LLVMGetLastInstruction,
     LLVMGetNextInstruction
+);
+
+llvm_iterator!(
+    IterDbgRecords,
+    DbgRecordsIter,
+    Instruction,
+    dbg_records_iter,
+    dbg_records_iter_mut,
+    LLVMDbgRecordRef,
+    DbgRecord,
+    LLVMGetFirstDbgRecord,
+    LLVMGetLastDbgRecord,
+    LLVMGetNextDbgRecord,
 );
