@@ -159,118 +159,25 @@ pub fn run_cargo(args: CargoArgs, command: &OsStr) -> anyhow::Result<()> {
         rustflags.push(format!(" -l {}=c++_static", link_type.to_string()));
         rustflags.push(format!(" -l {}=c++abi", link_type.to_string()));
     }
-    rustflags.push(
-        " -l static=LLVMWindowsManifest \
- -l static=LLVMXRay \
- -l static=LLVMLibDriver \
- -l static=LLVMDlltoolDriver \
- -l static=LLVMTextAPIBinaryReader \
- -l static=LLVMCoverage \
- -l static=LLVMLineEditor \
- -l static=LLVMSandboxIR \
- -l static=LLVMBPFDisassembler \
- -l static=LLVMBPFAsmParser \
- -l static=LLVMBPFCodeGen \
- -l static=LLVMBPFDesc \
- -l static=LLVMBPFInfo \
- -l static=LLVMOrcDebugging \
- -l static=LLVMOrcJIT \
- -l static=LLVMWindowsDriver \
- -l static=LLVMMCJIT \
- -l static=LLVMJITLink \
- -l static=LLVMInterpreter \
- -l static=LLVMExecutionEngine \
- -l static=LLVMRuntimeDyld \
- -l static=LLVMOrcTargetProcess \
- -l static=LLVMOrcShared \
- -l static=LLVMDWP \
- -l static=LLVMDebugInfoLogicalView \
- -l static=LLVMDebugInfoGSYM \
- -l static=LLVMOption \
- -l static=LLVMObjectYAML \
- -l static=LLVMObjCopy \
- -l static=LLVMMCA \
- -l static=LLVMMCDisassembler \
- -l static=LLVMLTO \
- -l static=LLVMPasses \
- -l static=LLVMHipStdPar \
- -l static=LLVMCFGuard \
- -l static=LLVMCoroutines \
- -l static=LLVMipo \
- -l static=LLVMVectorize \
- -l static=LLVMLinker \
- -l static=LLVMInstrumentation \
- -l static=LLVMFrontendOpenMP \
- -l static=LLVMFrontendOffloading \
- -l static=LLVMFrontendOpenACC \
- -l static=LLVMFrontendHLSL \
- -l static=LLVMFrontendDriver \
- -l static=LLVMExtensions \
- -l static=LLVMDWARFLinkerParallel \
- -l static=LLVMDWARFLinkerClassic \
- -l static=LLVMDWARFLinker \
- -l static=LLVMCodeGenData \
- -l static=LLVMGlobalISel \
- -l static=LLVMMIRParser \
- -l static=LLVMAsmPrinter \
- -l static=LLVMSelectionDAG \
- -l static=LLVMCodeGen \
- -l static=LLVMTarget \
- -l static=LLVMObjCARCOpts \
- -l static=LLVMCodeGenTypes \
- -l static=LLVMIRPrinter \
- -l static=LLVMInterfaceStub \
- -l static=LLVMFileCheck \
- -l static=LLVMFuzzMutate \
- -l static=LLVMScalarOpts \
- -l static=LLVMInstCombine \
- -l static=LLVMAggressiveInstCombine \
- -l static=LLVMTransformUtils \
- -l static=LLVMBitWriter \
- -l static=LLVMAnalysis \
- -l static=LLVMProfileData \
- -l static=LLVMSymbolize \
- -l static=LLVMDebugInfoBTF \
- -l static=LLVMDebugInfoPDB \
- -l static=LLVMDebugInfoMSF \
- -l static=LLVMDebugInfoDWARF \
- -l static=LLVMObject \
- -l static=LLVMTextAPI \
- -l static=LLVMMCParser \
- -l static=LLVMIRReader \
- -l static=LLVMAsmParser \
- -l static=LLVMMC \
- -l static=LLVMDebugInfoCodeView \
- -l static=LLVMBitReader \
- -l static=LLVMFuzzerCLI \
- -l static=LLVMCore \
- -l static=LLVMRemarks \
- -l static=LLVMBitstreamReader \
- -l static=LLVMBinaryFormat \
- -l static=LLVMTargetParser \
- -l static=LLVMTableGen \
- -l static=LLVMSupport \
- -l static=LLVMDemangle",
-    );
 
-    // for entry in read_dir(Path::new(&llvm_install_dir).join("lib"))
-    //     .context("LLVM build directory not found")?
-    // {
-    //     let entry = entry.context("failed to retrieve the file in the LLVM build directory")?;
-    //     let path = entry.path();
-    //     if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("a") {
-    //         rustflags.push(" -l static=");
-    //         rustflags.push(
-    //             path.file_name()
-    //                 .unwrap()
-    //                 .to_string_lossy()
-    //                 .strip_prefix("lib")
-    //                 .unwrap()
-    //                 .strip_suffix(".a")
-    //                 .unwrap(),
-    //         );
-    //     }
-    // }
+    for entry in read_dir(Path::new(&llvm_install_dir).join("lib"))
+        .context("LLVM build directory not found")?
+    {
+        let entry = entry.context("failed to retrieve the file in the LLVM build directory")?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("a") {
+            rustflags.push(" -l static=");
+            rustflags.push(
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .strip_prefix("lib")
+                    .unwrap()
+                    .strip_suffix(".a")
+                    .unwrap(),
+            );
+        }
+    }
 
     match triple.container_image() {
         Some((container_image, _)) => {
