@@ -193,7 +193,10 @@ pub fn run_cargo(args: CargoArgs, command: &OsStr) -> anyhow::Result<()> {
 
             let rustup_toolchain = env::var("RUSTUP_TOOLCHAIN").unwrap();
             let rustup_toolchain = rustup_toolchain.split('-').next().unwrap();
-            let rustup_toolchain = format!("{rustup_toolchain}-{}", triple.to_string());
+            let mut rustup_toolchain_triple = target_lexicon::HOST;
+            rustup_toolchain_triple.environment = triple.environment;
+            let rustup_toolchain =
+                format!("{rustup_toolchain}-{}", rustup_toolchain_triple.to_string());
             let mut rustup_toolchain_arg = OsString::from("RUSTUP_TOOLCHAIN=");
             rustup_toolchain_arg.push(rustup_toolchain);
 
