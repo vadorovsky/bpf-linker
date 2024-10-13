@@ -147,6 +147,7 @@ pub fn build_llvm(args: BuildLlvmArgs) -> anyhow::Result<()> {
             let mut cmd = Command::new(container_engine.to_string());
             cmd.args([
                 "run",
+                "--rm",
                 "-it",
                 "-w",
                 "/usr/local/src/llvm",
@@ -175,6 +176,7 @@ pub fn build_llvm(args: BuildLlvmArgs) -> anyhow::Result<()> {
             let mut cmd = Command::new(container_engine.to_string());
             cmd.args([
                 "run",
+                "--rm",
                 "-e",
                 // "PATH=/usr/lib/llvm/18/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "-it",

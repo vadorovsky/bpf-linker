@@ -36,7 +36,7 @@ pub enum LinkType {
 impl ToString for LinkType {
     fn to_string(&self) -> String {
         match self {
-            Self::Dynamic => "dynamic".to_owned(),
+            Self::Dynamic => "dylib".to_owned(),
             Self::Static => "static".to_owned(),
         }
     }
@@ -191,8 +191,11 @@ pub fn run_cargo(args: CargoArgs, command: &OsStr) -> anyhow::Result<()> {
             let mut llvm_prefix = OsString::from("LLVM_SYS_191_PREFIX=");
             llvm_prefix.push(&llvm_install_dir);
 
+            let rustup_toolchain = env::var("RUSTUP_TOOLCHAIN").unwrap();
+            let rustup_toolchain = rustup_toolchain.split('-').next().unwrap();
+            let rustup_toolchain = format!("{rustup_toolchain}-{}", triple.to_string());
             let mut rustup_toolchain_arg = OsString::from("RUSTUP_TOOLCHAIN=");
-            rustup_toolchain_arg.push(env::var("RUSTUP_TOOLCHAIN").unwrap());
+            rustup_toolchain_arg.push(rustup_toolchain);
 
             let mut workdir_arg = workdir;
             workdir_arg.push(":/usr/local/src/bpf-linker");
@@ -204,6 +207,7 @@ pub fn run_cargo(args: CargoArgs, command: &OsStr) -> anyhow::Result<()> {
             let mut cmd = Command::new(container_engine.to_string());
             cmd.args([
                 OsStr::new("run"),
+                OsStr::new("--rm"),
                 OsStr::new("-e"),
                 &llvm_prefix,
                 OsStr::new("-e"),
@@ -220,6 +224,8 @@ pub fn run_cargo(args: CargoArgs, command: &OsStr) -> anyhow::Result<()> {
                 OsStr::new(&container_image),
                 OsStr::new("cargo"),
                 command,
+                OsStr::new("--target"),
+                OsStr::new(&triple.to_string()),
             ]);
             match verbose {
                 0 => {}
