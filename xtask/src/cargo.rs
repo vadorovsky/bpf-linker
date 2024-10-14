@@ -119,6 +119,7 @@ pub fn run_cargo(args: CargoArgs, command: &OsStr) -> anyhow::Result<()> {
     };
 
     let link_type = link_type.unwrap_or(LinkType::default(&triple));
+    let sysroot = triple.sysroot();
 
     let llvm_install_dir = match llvm_install_dir {
         Some(llvm_install_dir) => llvm_install_dir,
@@ -145,9 +146,22 @@ pub fn run_cargo(args: CargoArgs, command: &OsStr) -> anyhow::Result<()> {
         }
     };
 
-    let mut rustflags = OsString::from("RUSTFLAGS=-L native=");
+    let mut rustflags = OsString::from("RUSTFLAGS=-C linker=clang");
+    if let Some(sysroot) = sysroot {
+        rustflags.push(" -C link-arg=--target=");
+        rustflags.push(triple.to_string());
+        rustflags.push(" -C link-arg=--sysroot=");
+        rustflags.push(sysroot.clone());
+        rustflags.push(" -L native=");
+        rustflags.push(sysroot.clone());
+        rustflags.push("/lib -L native=");
+        rustflags.push(sysroot);
+        rustflags.push("/usr/lib");
+    } else {
+        rustflags.push(" -L native=/lib -L native=/usr/lib");
+    }
+    rustflags.push(" -L native=");
     rustflags.push(Path::new(&llvm_install_dir).join("lib"));
-    rustflags.push(" -L native=/lib -L native=/usr/lib");
     rustflags.push(format!(" -l {}=rt", link_type.to_string()));
     rustflags.push(format!(" -l {}=dl", link_type.to_string()));
     rustflags.push(format!(" -l {}=m", link_type.to_string()));

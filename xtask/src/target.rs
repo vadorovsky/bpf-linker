@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 
 use clap::ValueEnum;
 use target_lexicon::{
@@ -127,6 +127,7 @@ pub trait TripleExt {
     fn containerized_build(&self) -> bool;
     fn container_image(&self) -> Option<(String, String)>;
     fn llvm_build_config(&self, install_prefix: &OsStr) -> Option<LlvmBuildConfig>;
+    fn sysroot(&self) -> Option<OsString>;
     fn is_cross(&self) -> bool;
 }
 
@@ -319,6 +320,32 @@ impl TripleExt for Triple {
                     processor: Processor::X86_64,
                     target_triple: "x86_64-gentoo-linux-musl".to_owned(),
                 })
+            }
+            (_, _, _) => None,
+        }
+    }
+
+    fn sysroot(&self) -> Option<OsString> {
+        if !self.is_cross() {
+            return None;
+        }
+
+        let Triple {
+            architecture,
+            operating_system,
+            environment,
+            ..
+        } = self;
+
+        match (architecture, operating_system, environment) {
+            (Architecture::Aarch64(_), OperatingSystem::Linux, Environment::Musl) => {
+                Some(OsString::from("/usr/aarch64-gentoo-linux-musl"))
+            }
+            (Architecture::Riscv64(_), OperatingSystem::Linux, Environment::Musl) => {
+                Some(OsString::from("/usr/riscv64-gentoo-linux-musl"))
+            }
+            (Architecture::X86_64, OperatingSystem::Linux, Environment::Musl) => {
+                Some(OsString::from("/usr/x86_64-gentoo-linux-musl"))
             }
             (_, _, _) => None,
         }
