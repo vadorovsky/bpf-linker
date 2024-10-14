@@ -127,6 +127,7 @@ pub trait TripleExt {
     fn containerized_build(&self) -> bool;
     fn container_image(&self) -> Option<(String, String)>;
     fn llvm_build_config(&self, install_prefix: &OsStr) -> Option<LlvmBuildConfig>;
+    fn libdirs(&self) -> Vec<OsString>;
     fn sysroot(&self) -> Option<OsString>;
     fn is_cross(&self) -> bool;
 }
@@ -165,6 +166,7 @@ impl TripleExt for Triple {
                 Some(LlvmBuildConfig {
                     c_compiler: "clang".to_owned(),
                     cxx_compiler: "clang++".to_owned(),
+                    compiler_target: None,
                     cxxflags: None,
                     ldflags: None,
                     install_prefix,
@@ -176,16 +178,9 @@ impl TripleExt for Triple {
             }
             (Architecture::Aarch64(_), OperatingSystem::Linux, Environment::Gnu) => {
                 Some(LlvmBuildConfig {
-                    c_compiler: if self.is_cross() {
-                        "aarch64-linux-gnu-clang".to_owned()
-                    } else {
-                        "clang".to_owned()
-                    },
-                    cxx_compiler: if self.is_cross() {
-                        "aarch64-linux-gnu-clang++".to_owned()
-                    } else {
-                        "clang".to_owned()
-                    },
+                    c_compiler: "clang".to_owned(),
+                    cxx_compiler: "clang++".to_owned(),
+                    compiler_target: Some("aarch64-linux-gnu".to_owned()),
                     cxxflags: None,
                     ldflags: None,
                     install_prefix,
@@ -209,6 +204,9 @@ impl TripleExt for Triple {
                     } else {
                         "clang++".to_owned()
                     },
+                    // The clang wrapper specified above takes care of setting
+                    // the target.
+                    compiler_target: None,
                     cxxflags: Some("-stdlib=libc++".to_owned()),
                     ldflags: Some(
                         "-rtlib=compiler-rt -unwindlib=libunwind -lc++ -lc++abi".to_owned(),
@@ -222,16 +220,9 @@ impl TripleExt for Triple {
             }
             (Architecture::Riscv64(_), OperatingSystem::Linux, Environment::Gnu) => {
                 Some(LlvmBuildConfig {
-                    c_compiler: if self.is_cross() {
-                        "riscv64-linux-gnu-clang".to_owned()
-                    } else {
-                        "clang".to_owned()
-                    },
-                    cxx_compiler: if self.is_cross() {
-                        "riscv64-linux-gnu-clang++".to_owned()
-                    } else {
-                        "clang++".to_owned()
-                    },
+                    c_compiler: "clang".to_owned(),
+                    cxx_compiler: "clang++".to_owned(),
+                    compiler_target: Some("riscv64-linux-gnu".to_owned()),
                     cxxflags: None,
                     ldflags: None,
                     install_prefix,
@@ -255,6 +246,9 @@ impl TripleExt for Triple {
                     } else {
                         "clang++".to_owned()
                     },
+                    // The clang wrapper specified above takes care of setting
+                    // the target.
+                    compiler_target: None,
                     cxxflags: None,
                     ldflags: None,
                     install_prefix,
@@ -269,6 +263,7 @@ impl TripleExt for Triple {
                     c_compiler: "clang".to_owned(),
                     cxx_compiler: "clang++".to_owned(),
                     cxxflags: None,
+                    compiler_target: None,
                     ldflags: None,
                     install_prefix,
                     skip_install_rpath: false,
@@ -279,16 +274,9 @@ impl TripleExt for Triple {
             }
             (Architecture::X86_64, OperatingSystem::Linux, Environment::Gnu) => {
                 Some(LlvmBuildConfig {
-                    c_compiler: if self.is_cross() {
-                        "x86_64-linux-gnu-clang".to_owned()
-                    } else {
-                        "clang".to_owned()
-                    },
-                    cxx_compiler: if self.is_cross() {
-                        "x86_64-linux-gnu-clang++".to_owned()
-                    } else {
-                        "clang++".to_owned()
-                    },
+                    c_compiler: "clang".to_owned(),
+                    cxx_compiler: "clang++".to_owned(),
+                    compiler_target: Some("x86_64-linux-gnu".to_owned()),
                     cxxflags: None,
                     ldflags: None,
                     install_prefix,
@@ -312,6 +300,9 @@ impl TripleExt for Triple {
                     } else {
                         "clang++".to_owned()
                     },
+                    // The clang wrapper specified above takes care of setting
+                    // the target.
+                    compiler_target: None,
                     cxxflags: None,
                     ldflags: None,
                     install_prefix,
@@ -322,6 +313,68 @@ impl TripleExt for Triple {
                 })
             }
             (_, _, _) => None,
+        }
+    }
+
+    fn libdirs(&self) -> Vec<OsString> {
+        if !self.is_cross() {
+            return vec![OsString::from("/lib"), OsString::from("/usr/lib")];
+        }
+
+        let Triple {
+            architecture,
+            operating_system,
+            environment,
+            ..
+        } = self;
+
+        // Cross packages in Debian (which we use for GNU builds) install
+        // libraries either in:
+        //
+        // - `/usr/<triple>/lib`
+        // - `/usr/lib/<triple>`
+        //
+        // Cross packages in Gentoo (which we use for musl builds) are always
+        // installed in the sysroot (`/usr/<triple>`), which follows the same
+        // directory structure as host environments.
+        match (architecture, operating_system, environment) {
+            (Architecture::Aarch64(_), OperatingSystem::Linux, Environment::Gnu) => {
+                vec![
+                    OsString::from("/usr/aarch64-linux-gnu/lib"),
+                    OsString::from("/usr/lib/aarch64-linux-gnu"),
+                ]
+            }
+            (Architecture::Aarch64(_), OperatingSystem::Linux, Environment::Musl) => {
+                vec![
+                    OsString::from("/usr/aarch64-gentoo-linux-musl/lib"),
+                    OsString::from("/usr/aarch64-gentoo-linux-musl/usr/lib"),
+                ]
+            }
+            (Architecture::Riscv64(_), OperatingSystem::Linux, Environment::Gnu) => {
+                vec![
+                    OsString::from("/usr/riscv64-linux-gnu/lib"),
+                    OsString::from("/usr/lib/riscv64-linux-gnu"),
+                ]
+            }
+            (Architecture::Riscv64(_), OperatingSystem::Linux, Environment::Musl) => {
+                vec![
+                    OsString::from("/usr/riscv64-gentoo-linux-musl/lib"),
+                    OsString::from("/usr/riscv64-gentoo-linux-musl/usr/lib"),
+                ]
+            }
+            (Architecture::X86_64, OperatingSystem::Linux, Environment::Gnu) => {
+                vec![
+                    OsString::from("/usr/x86_64-linux-gnu/lib"),
+                    OsString::from("/usr/lib/x86_64-linux-gnu"),
+                ]
+            }
+            (Architecture::X86_64, OperatingSystem::Linux, Environment::Musl) => {
+                vec![
+                    OsString::from("/usr/x86_64-gentoo-linux-musl/lib"),
+                    OsString::from("/usr/x86_64-gentoo-linux-musl/usr/lib"),
+                ]
+            }
+            (_, _, _) => vec![OsString::from("/lib"), OsString::from("/usr/lib")],
         }
     }
 

@@ -16,8 +16,10 @@ pub enum ContainerError {
     UnsupportedTarget(String),
     #[error("failed to build a container image")]
     ContainerImageBuild,
+    #[error("failed to push a container image")]
+    ContainerImagePush,
     #[error("failed to tag a container image as latest")]
-    ContainerTag,
+    ContainerImageTag,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -58,15 +60,33 @@ pub struct BuildContainerImageArgs {
     #[arg(long)]
     no_cache: bool,
 
+    /// Push the image after build.
+    #[arg(long)]
+    push: bool,
+
     /// Target triple (optional)
     #[arg(short, long)]
     target: Option<SupportedTriple>,
+}
+
+fn push_image(container_engine: &ContainerEngine, tag: &str) -> anyhow::Result<()> {
+    let mut cmd = Command::new(container_engine.to_string());
+    cmd.args(["push", tag])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    println!("{cmd:?}");
+    if !cmd.status()?.success() {
+        return Err(ContainerError::ContainerImagePush.into());
+    }
+    Ok(())
 }
 
 pub fn build_container_image(args: BuildContainerImageArgs) -> anyhow::Result<()> {
     let BuildContainerImageArgs {
         container_engine,
         no_cache,
+        push,
         target,
     } = args;
 
@@ -111,7 +131,12 @@ pub fn build_container_image(args: BuildContainerImageArgs) -> anyhow::Result<()
                 .stderr(Stdio::inherit());
             println!("{cmd:?}");
             if !cmd.status()?.success() {
-                return Err(ContainerError::ContainerTag.into());
+                return Err(ContainerError::ContainerImageTag.into());
+            }
+
+            if push {
+                push_image(&container_engine, &tag_with_date)?;
+                push_image(&container_engine, &tag_latest)?;
             }
 
             Ok(())

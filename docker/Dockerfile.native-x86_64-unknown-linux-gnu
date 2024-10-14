@@ -2,9 +2,6 @@ FROM docker.io/ubuntu:22.04
 
 ENV PATH="/root/.cargo/bin:/usr/lib/llvm-15/bin:${PATH}"
 
-# Ubuntu doesn't ship static zlib and zstd, because they adhere to the belief
-# about "static linking considered harmful", so we have to build them
-# ourselves.
 RUN apt update \
     && apt install -y \
         build-essential \

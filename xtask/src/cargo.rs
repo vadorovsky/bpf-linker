@@ -147,18 +147,17 @@ pub fn run_cargo(args: CargoArgs, command: &OsStr) -> anyhow::Result<()> {
     };
 
     let mut rustflags = OsString::from("RUSTFLAGS=-C linker=clang");
-    if let Some(sysroot) = sysroot {
+    if triple.is_cross() {
         rustflags.push(" -C link-arg=--target=");
         rustflags.push(triple.to_string());
+    }
+    if let Some(sysroot) = sysroot {
         rustflags.push(" -C link-arg=--sysroot=");
         rustflags.push(sysroot.clone());
+    }
+    for libdir in triple.libdirs() {
         rustflags.push(" -L native=");
-        rustflags.push(sysroot.clone());
-        rustflags.push("/lib -L native=");
-        rustflags.push(sysroot);
-        rustflags.push("/usr/lib");
-    } else {
-        rustflags.push(" -L native=/lib -L native=/usr/lib");
+        rustflags.push(libdir);
     }
     rustflags.push(" -L native=");
     rustflags.push(Path::new(&llvm_install_dir).join("lib"));

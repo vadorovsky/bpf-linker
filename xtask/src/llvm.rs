@@ -33,6 +33,7 @@ impl ToString for Processor {
 pub struct LlvmBuildConfig {
     pub c_compiler: String,
     pub cxx_compiler: String,
+    pub compiler_target: Option<String>,
     pub cxxflags: Option<String>,
     pub ldflags: Option<String>,
     pub install_prefix: OsString,
@@ -47,6 +48,7 @@ impl LlvmBuildConfig {
         let LlvmBuildConfig {
             c_compiler,
             cxx_compiler,
+            compiler_target,
             cxxflags,
             ldflags,
             install_prefix,
@@ -95,6 +97,17 @@ impl LlvmBuildConfig {
             OsString::from("-DLLVM_USE_LINKER=lld"),
         ];
 
+        if let Some(compiler_target) = compiler_target {
+            args.push(OsString::from(format!(
+                "-DCMAKE_ASM_COMPILER_TARGET={compiler_target}"
+            )));
+            args.push(OsString::from(format!(
+                "-DCMAKE_C_COMPILER_TARGET={compiler_target}"
+            )));
+            args.push(OsString::from(format!(
+                "-DCMAKE_CXX_COMPILER_TARGET={compiler_target}"
+            )));
+        }
         if let Some(cxxflags) = cxxflags {
             args.push(OsString::from(format!("-DCMAKE_CXX_FLAGS='{cxxflags}'")));
         }

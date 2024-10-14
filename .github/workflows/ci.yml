@@ -47,6 +47,36 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  build-container-image:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
+          - target: riscv64-unknown-linux-gnu
+          - target: riscv64-unknown-linux-musl
+          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
+    name: container target=${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          set -euxo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build container image
+        run: |
+          set -euxo pipefail
+          cargo xtask build-container-image \
+            --target ${{ matrix.target }} \
+            --push
+
   build:
     runs-on: ${{ matrix.target.os }}
     strategy:
