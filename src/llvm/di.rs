@@ -1,20 +1,25 @@
 use std::{
     borrow::Cow,
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
-    ffi::c_char,
     hash::Hasher,
-    ptr,
+    ptr::NonNull,
 };
 
 use gimli::{DW_TAG_pointer_type, DW_TAG_structure_type, DW_TAG_variant_part};
 use llvm_sys::{core::*, debuginfo::*, prelude::*};
 use tracing::{span, trace, warn, Level};
 
-use super::types::{
-    di::DIType,
-    ir::{Function, MDNode, Metadata, Value},
+use crate::llvm::{
+    iter::*,
+    types::{
+        ir::{
+            Argument, DIType, Function, GlobalAlias, GlobalVariable, Instruction,
+            LLVMContextWrapper, LLVMTypeWrapperWithContext, MDNode, Metadata, Module, NamedValue,
+            Value,
+        },
+        LLVMTypeError, LLVMTypeWrapper,
+    },
 };
-use crate::llvm::{iter::*, types::di::DISubprogram};
 
 // KSYM_NAME_LEN from linux kernel intentionally set
 // to lower value found accross kernel versions to ensure
@@ -22,9 +27,8 @@ use crate::llvm::{iter::*, types::di::DISubprogram};
 const MAX_KSYM_NAME_LEN: usize = 128;
 
 pub struct DISanitizer {
-    context: LLVMContextRef,
-    module: LLVMModuleRef,
-    builder: LLVMDIBuilderRef,
+    // context: LLVMContextRef,
+    // builder: LLVMDIBuilderRef,
     visited_nodes: HashSet<u64>,
     replace_operands: HashMap<u64, LLVMMetadataRef>,
     skipped_types: Vec<String>,
@@ -59,11 +63,12 @@ fn sanitize_type_name<T: AsRef<str>>(name: T) -> String {
 }
 
 impl DISanitizer {
-    pub fn new(context: LLVMContextRef, module: LLVMModuleRef) -> DISanitizer {
+    // pub fn new(context: LLVMContextRef, module: &Module<'_>) -> Self {
+    pub fn new() -> Self {
+        // let builder = unsafe { LLVMCreateDIBuilder(module.as_ptr()) };
         DISanitizer {
-            context,
-            module,
-            builder: unsafe { LLVMCreateDIBuilder(module) },
+            // context,
+            // builder,
             visited_nodes: HashSet::new(),
             replace_operands: HashMap::new(),
             skipped_types: Vec::new(),
@@ -112,10 +117,8 @@ impl DISanitizer {
                                             let filename = file.filename();
 
                                             let name = match names {
-                                                Some((ref original_name, _)) => {
-                                                    original_name.to_owned()
-                                                }
-                                                None => "(anon)".to_owned(),
+                                                Some((ref original_name, _)) => original_name,
+                                                None => "(anon)",
                                             };
                                             let filename = match filename {
                                                 Some(filename) => {
@@ -127,7 +130,7 @@ impl DISanitizer {
                                             trace!(
                                                 "found data carrying enum {name} ({filename}:{line}), not emitting the debug info for it"
                                             );
-                                            self.skipped_types.push(name);
+                                            self.skipped_types.push(name.to_owned());
 
                                             is_data_carrying_enum = true;
                                             break;
@@ -167,23 +170,24 @@ impl DISanitizer {
                                 _ => {}
                             }
                         }
+                        let mut context = di_composite_type.context();
                         if is_data_carrying_enum {
-                            di_composite_type.replace_elements(MDNode::empty(self.context));
+                            let mdnode = context.create_mdnode(&[]);
+                            di_composite_type.replace_elements(mdnode);
                         } else if !members.is_empty() {
                             members.sort_by_cached_key(|di_type| di_type.offset_in_bits());
-                            let sorted_elements =
-                                MDNode::with_elements(self.context, members.as_mut_slice());
+                            let sorted_elements = context.create_mdnode(members.as_mut_slice());
                             di_composite_type.replace_elements(sorted_elements);
                         }
                         if remove_name {
                             // `AyaBtfMapMarker` is a type which is used in fields of BTF map
                             // structs. We need to make such structs anonymous in order to get
                             // BTF maps accepted by the Linux kernel.
-                            di_composite_type.replace_name(self.context, "").unwrap();
+                            di_composite_type.replace_name("").unwrap();
                         } else if let Some((_, sanitized_name)) = names {
                             // Clear the name from characters incompatible with C.
                             di_composite_type
-                                .replace_name(self.context, sanitized_name.as_str())
+                                .replace_name(sanitized_name.as_str())
                                 .unwrap();
                         }
                     }
@@ -196,7 +200,7 @@ impl DISanitizer {
                 match di_derived_type.tag() {
                     DW_TAG_pointer_type => {
                         // remove rust names
-                        di_derived_type.replace_name(self.context, "").unwrap();
+                        di_derived_type.replace_name("").unwrap();
                     }
                     _ => (),
                 }
@@ -205,9 +209,7 @@ impl DISanitizer {
                 // Sanitize function names
                 if let Some(name) = di_subprogram.name() {
                     let name = sanitize_type_name(name);
-                    di_subprogram
-                        .replace_name(self.context, name.as_str())
-                        .unwrap();
+                    di_subprogram.replace_name(name.as_str()).unwrap();
                 }
             }
             _ => (),
@@ -227,7 +229,7 @@ impl DISanitizer {
             // An operand with no value is valid and means that the operand is
             // not set
             (v, Item::Operand { .. }) if v.is_null() => return,
-            (v, _) if !v.is_null() => Value::new(v),
+            (v, _) if !v.is_null() => Value::from_ptr(NonNull::new(v).unwrap()).unwrap(),
             // All other items should have values
             (_, item) => panic!("{item:?} has no value"),
         };
@@ -237,7 +239,7 @@ impl DISanitizer {
             // seen its value or not, since the same value can appear as an operand in multiple
             // nodes in the tree.
             if let Some(new_metadata) = self.replace_operands.get(&value_id) {
-                operand.replace(unsafe { LLVMMetadataAsValue(self.context, *new_metadata) })
+                operand.replace(unsafe { LLVMMetadataAsValue(context.as_ptr(), *new_metadata) })
             }
         }
 
@@ -263,7 +265,7 @@ impl DISanitizer {
 
         if let Some(entries) = value.metadata_entries() {
             for (index, (metadata, kind)) in entries.iter().enumerate() {
-                let metadata_value = unsafe { LLVMMetadataAsValue(self.context, metadata) };
+                let metadata_value = unsafe { LLVMMetadataAsValue(context.as_ptr(), metadata) };
                 self.visit_item(Item::MetadataEntry(metadata_value, kind, index));
             }
         }
@@ -283,16 +285,22 @@ impl DISanitizer {
         }
     }
 
-    pub fn run(mut self, exported_symbols: &HashSet<Cow<'static, str>>) {
-        let module = self.module;
+    pub fn run(
+        mut self,
+        // context: &mut Context<'_>,
+        module: &mut Module,
+        module_name: &str,
+        exported_symbols: &HashSet<Cow<'static, str>>,
+    ) -> Result<(), LLVMTypeError> {
+        // let module = context.module_mut(module_name).unwrap();
+        self.replace_operands =
+            self.fix_subprogram_linkage(module, module_name, exported_symbols)?;
 
-        self.replace_operands = self.fix_subprogram_linkage(exported_symbols);
-
-        for value in module.globals_iter() {
-            self.visit_item(Item::GlobalVariable(value));
+        for global in module.globals_iter() {
+            self.visit_item(Item::GlobalVariable(global));
         }
-        for value in module.global_aliases_iter() {
-            self.visit_item(Item::GlobalAlias(value));
+        for alias in module.global_aliases_iter() {
+            self.visit_item(Item::GlobalAlias(alias));
         }
 
         for function in module.functions_iter() {
@@ -306,7 +314,7 @@ impl DISanitizer {
             );
         }
 
-        unsafe { LLVMDisposeDIBuilder(self.builder) };
+        Ok(())
     }
 
     // Make it so that only exported symbols (programs marked as #[no_mangle]) get BTF
@@ -324,21 +332,22 @@ impl DISanitizer {
     // See tests/btf/assembly/exported-symbols.rs .
     fn fix_subprogram_linkage(
         &mut self,
+        // context: &mut Context<'_>,
+        module: &mut Module<'_>,
+        module_name: &str,
         export_symbols: &HashSet<Cow<'static, str>>,
-    ) -> HashMap<u64, LLVMMetadataRef> {
+    ) -> Result<HashMap<u64, LLVMMetadataRef>, LLVMTypeError> {
+        // let module = context.module_mut(module_name).unwrap();
         let mut replace = HashMap::new();
+        let builder = module.di_builder();
 
-        for mut function in self
-            .module
-            .functions_iter()
-            .map(|value| unsafe { Function::from_value_ref(value) })
-        {
-            if export_symbols.contains(function.name()) {
+        for mut function in module.functions_iter() {
+            if export_symbols.contains(&function.name()) {
                 continue;
             }
 
             // Skip functions that don't have subprograms.
-            let Some(mut subprogram) = function.subprogram(self.context) else {
+            let Some(mut subprogram) = function.subprogram() else {
                 continue;
             };
 
@@ -348,30 +357,20 @@ impl DISanitizer {
 
             // Create a new subprogram that has DISPFlagLocalToUnit set, so the BTF backend emits it
             // with linkage=static
-            let mut new_program = unsafe {
-                let new_program = LLVMDIBuilderCreateFunction(
-                    self.builder,
-                    subprogram.scope().unwrap(),
-                    name.as_ptr() as *const c_char,
-                    name.len(),
-                    linkage_name.map(|s| s.as_ptr()).unwrap_or(ptr::null()) as *const c_char,
-                    linkage_name.unwrap_or("").len(),
-                    subprogram.file(),
-                    subprogram.line(),
-                    ty,
-                    1,
-                    1,
-                    subprogram.line(),
-                    subprogram.type_flags(),
-                    1,
-                );
-                // Technically this must be called as part of the builder API, but effectively does
-                // nothing because we don't add any variables through the builder API, instead we
-                // replace retained nodes manually below.
-                LLVMDIBuilderFinalizeSubprogram(self.builder, new_program);
-
-                DISubprogram::from_value_ref(LLVMMetadataAsValue(self.context, new_program))
-            };
+            let mut new_program = builder.create_function(
+                &subprogram.scope().unwrap(),
+                name,
+                linkage_name.unwrap_or(""),
+                &subprogram.file(),
+                subprogram.line(),
+                &ty,
+                true,
+                true,
+                subprogram.line(),
+                subprogram.type_flags(),
+                true,
+            );
+            builder.finalize_subprogram(&subprogram);
 
             // Point the function to the new subprogram.
             function.set_subprogram(&new_program);
@@ -393,26 +392,26 @@ impl DISanitizer {
             // its debug variables no longer point to the program. See the
             // NumAbstractSubprograms assertion in DwarfDebug::endFunctionImpl in LLVM.
             let empty_node =
-                unsafe { LLVMMDNodeInContext2(self.context, core::ptr::null_mut(), 0) };
+                unsafe { LLVMMDNodeInContext2(context.as_ptr(), core::ptr::null_mut(), 0) };
             subprogram.set_retained_nodes(empty_node);
 
-            let ret = replace.insert(subprogram.value_ref as u64, unsafe {
-                LLVMValueAsMetadata(new_program.value_ref)
+            let ret = replace.insert(subprogram.as_ptr() as u64, unsafe {
+                LLVMValueAsMetadata(new_program.as_ptr())
             });
             assert!(ret.is_none());
         }
 
-        replace
+        Ok(replace)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Item {
-    GlobalVariable(LLVMValueRef),
-    GlobalAlias(LLVMValueRef),
-    Function(LLVMValueRef),
-    FunctionParam(LLVMValueRef),
-    Instruction(LLVMValueRef),
+    GlobalVariable(GlobalVariable),
+    GlobalAlias(GlobalAlias),
+    Function(Function),
+    FunctionParam(Argument),
+    Instruction(Instruction),
     Operand(Operand),
     MetadataEntry(LLVMValueRef, u32, usize),
 }
@@ -440,13 +439,13 @@ impl Operand {
 impl Item {
     fn value_ref(&self) -> LLVMValueRef {
         match self {
-            Item::GlobalVariable(value)
-            | Item::GlobalAlias(value)
-            | Item::Function(value)
-            | Item::FunctionParam(value)
-            | Item::Instruction(value)
-            | Item::Operand(Operand { value, .. })
-            | Item::MetadataEntry(value, _, _) => *value,
+            Item::GlobalVariable(global) => global.as_ptr(),
+            Item::GlobalAlias(global) => global.as_ptr(),
+            Item::Function(function) => function.as_ptr(),
+            Item::FunctionParam(function_param) => function_param.as_ptr(),
+            Item::Instruction(instruction) => instruction.as_ptr(),
+            Item::Operand(Operand { value, .. }) => *value,
+            Item::MetadataEntry(value, _, _) => *value,
         }
     }
 

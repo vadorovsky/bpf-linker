@@ -1,7 +1,3 @@
-mod di;
-mod iter;
-mod types;
-
 use std::{
     borrow::Cow,
     collections::HashSet,
@@ -18,9 +14,7 @@ use llvm_sys::{
     core::{
         LLVMCreateMemoryBufferWithMemoryRange, LLVMDisposeMemoryBuffer, LLVMDisposeMessage,
         LLVMGetDiagInfoDescription, LLVMGetDiagInfoSeverity, LLVMGetEnumAttributeKindForName,
-        LLVMGetMDString, LLVMGetModuleInlineAsm, LLVMGetTarget, LLVMGetValueName2,
-        LLVMModuleCreateWithNameInContext, LLVMPrintModuleToFile, LLVMRemoveEnumAttributeAtIndex,
-        LLVMSetLinkage, LLVMSetModuleInlineAsm2, LLVMSetVisibility,
+        LLVMPrintModuleToFile, LLVMRemoveEnumAttributeAtIndex,
     },
     debuginfo::LLVMStripModuleDebugInfo,
     error::{
@@ -32,25 +26,31 @@ use llvm_sys::{
         LLVMGetSectionName, LLVMGetSectionSize, LLVMMoveToNextSection,
         LLVMObjectFileCopySectionIterator, LLVMObjectFileIsSectionIteratorAtEnd,
     },
-    prelude::{LLVMContextRef, LLVMDiagnosticInfoRef, LLVMModuleRef, LLVMValueRef},
+    prelude::{LLVMContextRef, LLVMDiagnosticInfoRef, LLVMModuleRef},
     support::LLVMParseCommandLineOptions,
     target::{
         LLVMInitializeBPFAsmParser, LLVMInitializeBPFAsmPrinter, LLVMInitializeBPFDisassembler,
         LLVMInitializeBPFTarget, LLVMInitializeBPFTargetInfo, LLVMInitializeBPFTargetMC,
     },
-    target_machine::{
-        LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMCreateTargetMachine,
-        LLVMGetTargetFromTriple, LLVMRelocMode, LLVMTargetMachineEmitToFile, LLVMTargetMachineRef,
-        LLVMTargetRef,
-    },
+    target_machine::{LLVMCodeGenFileType, LLVMTargetMachineEmitToFile, LLVMTargetMachineRef},
     transforms::pass_builder::{
         LLVMCreatePassBuilderOptions, LLVMDisposePassBuilderOptions, LLVMRunPasses,
     },
     LLVMAttributeFunctionIndex, LLVMLinkage, LLVMVisibility,
 };
 use tracing::{debug, error};
+use types::ir::{Function, GlobalValue, NamedValue};
 
 use crate::OptLevel;
+
+mod di;
+mod iter;
+mod types;
+pub use types::{
+    ir::{Context, Module},
+    target::{Target, TargetMachine},
+    LLVMTypeError, LLVMTypeWrapper,
+};
 
 pub unsafe fn init<T: AsRef<str>>(args: &[T], overview: &str) {
     LLVMInitializeBPFTarget();
@@ -71,17 +71,6 @@ unsafe fn parse_command_line_options<T: AsRef<str>>(args: &[T], overview: &str) 
     let c_ptrs = c_args.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
     let overview = CString::new(overview).unwrap();
     LLVMParseCommandLineOptions(c_ptrs.len() as i32, c_ptrs.as_ptr(), overview.as_ptr());
-}
-
-pub unsafe fn create_module(name: &str, context: LLVMContextRef) -> Option<LLVMModuleRef> {
-    let c_name = CString::new(name).unwrap();
-    let module = LLVMModuleCreateWithNameInContext(c_name.as_ptr(), context);
-
-    if module.is_null() {
-        return None;
-    }
-
-    Some(module)
 }
 
 pub unsafe fn find_embedded_bitcode(
@@ -149,72 +138,34 @@ pub unsafe fn link_bitcode_buffer(
     linked
 }
 
-pub unsafe fn target_from_triple(triple: &CStr) -> Result<LLVMTargetRef, String> {
-    let mut target = ptr::null_mut();
-    let (ret, message) =
-        Message::with(|message| LLVMGetTargetFromTriple(triple.as_ptr(), &mut target, message));
-    if ret == 0 {
-        Ok(target)
-    } else {
-        Err(message.as_c_str().unwrap().to_str().unwrap().to_string())
-    }
-}
-
-pub unsafe fn target_from_module(module: LLVMModuleRef) -> Result<LLVMTargetRef, String> {
-    let triple = LLVMGetTarget(module);
-    target_from_triple(CStr::from_ptr(triple))
-}
-
-pub unsafe fn create_target_machine(
-    target: LLVMTargetRef,
-    triple: &str,
-    cpu: &str,
-    features: &str,
-) -> Option<LLVMTargetMachineRef> {
-    let triple = CString::new(triple).unwrap();
-    let cpu = CString::new(cpu).unwrap();
-    let features = CString::new(features).unwrap();
-    let tm = LLVMCreateTargetMachine(
-        target,
-        triple.as_ptr(),
-        cpu.as_ptr(),
-        features.as_ptr(),
-        LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
-        LLVMRelocMode::LLVMRelocDefault,
-        LLVMCodeModel::LLVMCodeModelDefault,
-    );
-    if tm.is_null() {
-        None
-    } else {
-        Some(tm)
-    }
-}
-
 pub unsafe fn optimize(
-    tm: LLVMTargetMachineRef,
-    module: LLVMModuleRef,
+    tm: &TargetMachine,
+    module: &mut Module<'_>,
     opt_level: OptLevel,
     ignore_inline_never: bool,
     export_symbols: &HashSet<Cow<'static, str>>,
 ) -> Result<(), String> {
     if module_asm_is_probestack(module) {
-        LLVMSetModuleInlineAsm2(module, ptr::null_mut(), 0);
+        module.set_inline_asm("");
     }
 
-    for sym in module.globals_iter() {
-        internalize(sym, symbol_name(sym), export_symbols);
+    for mut sym in module.globals_iter() {
+        let name = sym.name();
+        internalize(&mut sym, &name, export_symbols);
     }
-    for sym in module.global_aliases_iter() {
-        internalize(sym, symbol_name(sym), export_symbols);
+    for mut sym in module.global_aliases_iter() {
+        let name = sym.name();
+        internalize(&mut sym, &name, export_symbols);
     }
 
-    for function in module.functions_iter() {
-        let name = symbol_name(function);
-        if !name.starts_with("llvm.") {
+    for mut function in module.functions_iter() {
+        let name = function.name().into_owned();
+        let to_internalize = !name.starts_with("llvm.");
+        if to_internalize {
             if ignore_inline_never {
-                remove_attribute(function, "noinline");
+                remove_attribute(&mut function, "noinline");
             }
-            internalize(function, name, export_symbols);
+            internalize(&mut function, &name, export_symbols);
         }
     }
 
@@ -239,7 +190,7 @@ pub unsafe fn optimize(
     debug!("running passes: {passes}");
     let passes = CString::new(passes).unwrap();
     let options = LLVMCreatePassBuilderOptions();
-    let error = LLVMRunPasses(module, passes.as_ptr(), tm, options);
+    let error = LLVMRunPasses(module.as_ptr(), passes.as_ptr(), tm.as_ptr(), options);
     LLVMDisposePassBuilderOptions(options);
     // Handle the error and print it to stderr.
     if !error.is_null() {
@@ -260,26 +211,14 @@ pub unsafe fn strip_debug_info(module: LLVMModuleRef) -> bool {
     LLVMStripModuleDebugInfo(module) != 0
 }
 
-unsafe fn module_asm_is_probestack(module: LLVMModuleRef) -> bool {
-    let mut len = 0;
-    let ptr = LLVMGetModuleInlineAsm(module, &mut len);
-    if ptr.is_null() {
-        return false;
-    }
-
-    let asm = String::from_utf8_lossy(slice::from_raw_parts(ptr as *const c_uchar, len));
+fn module_asm_is_probestack(module: &Module) -> bool {
+    let asm = module.inline_asm();
     asm.contains("__rust_probestack")
 }
 
-fn symbol_name<'a>(value: *mut llvm_sys::LLVMValue) -> &'a str {
-    let mut name_len = 0;
-    let ptr = unsafe { LLVMGetValueName2(value, &mut name_len) };
-    unsafe { str::from_utf8(slice::from_raw_parts(ptr as *const c_uchar, name_len)).unwrap() }
-}
-
-unsafe fn remove_attribute(function: *mut llvm_sys::LLVMValue, name: &str) {
+unsafe fn remove_attribute(function: &mut Function, name: &str) {
     let attr_kind = LLVMGetEnumAttributeKindForName(name.as_ptr() as *const c_char, name.len());
-    LLVMRemoveEnumAttributeAtIndex(function, LLVMAttributeFunctionIndex, attr_kind);
+    LLVMRemoveEnumAttributeAtIndex(function.as_ptr(), LLVMAttributeFunctionIndex, attr_kind);
 }
 
 pub unsafe fn write_ir(module: LLVMModuleRef, output: &CStr) -> Result<(), String> {
@@ -308,14 +247,14 @@ pub unsafe fn codegen(
     }
 }
 
-pub unsafe fn internalize(
-    value: LLVMValueRef,
+pub unsafe fn internalize<T: GlobalValue>(
+    value: &mut T,
     name: &str,
     export_symbols: &HashSet<Cow<'static, str>>,
 ) {
     if !name.starts_with("llvm.") && !export_symbols.contains(name) {
-        LLVMSetLinkage(value, LLVMLinkage::LLVMInternalLinkage);
-        LLVMSetVisibility(value, LLVMVisibility::LLVMDefaultVisibility);
+        value.set_linkage(LLVMLinkage::LLVMInternalLinkage);
+        value.set_visibility(LLVMVisibility::LLVMDefaultVisibility);
     }
 }
 
@@ -368,10 +307,4 @@ impl Drop for Message {
             }
         }
     }
-}
-
-fn mdstring_to_str<'a>(mdstring: LLVMValueRef) -> &'a str {
-    let mut len = 0;
-    let ptr = unsafe { LLVMGetMDString(mdstring, &mut len) };
-    unsafe { str::from_utf8(slice::from_raw_parts(ptr as *const c_uchar, len as usize)).unwrap() }
 }
