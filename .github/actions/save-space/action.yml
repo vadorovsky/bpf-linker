@@ -1,0 +1,35 @@
+name: Save space
+description: Free up disk space by removing unwanted software
+runs:
+  using: "composite"
+  steps:
+    - run: |
+        sudo docker image prune --all --force
+        sudo rm -rf \
+          /opt/ghc \
+          /opt/hostedtoolcache/CodeQL \
+          /usr/local/.ghcup \
+          /usr/local/lib/android \
+          /usr/share/dotnet
+        sudo apt-get remove -y \
+          '^aspnetcore-.*' \
+          '^dotnet-.*' \
+          'php.*' \
+          '^mongodb-.*' \
+          '^mysql-.*' \
+          azure-cli \
+          firefox \
+          mono-devel \
+          libgl1-mesa-dri \
+          --fix-missing
+        if [[ "$(uname -m)" == "x86_64" ]]; then
+          sudo apt-get remove -y \
+            google-chrome-stable \
+            microsoft-edge-stable \
+            google-cloud-cli \
+            powershell \
+            --fix-missing
+        fi
+        sudo apt-get autoremove -y
+        sudo apt-get clean        
+      shell: bash
