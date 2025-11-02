@@ -5,12 +5,12 @@ use rustc_build_sysroot::{BuildMode, SysrootConfig, SysrootStatus};
 use walkdir::WalkDir;
 
 #[derive(Clone, clap::ValueEnum)]
-enum Target {
+enum StdTarget {
     BpfebUnknownNone,
     BpfelUnknownNone,
 }
 
-impl Target {
+impl StdTarget {
     fn as_str(&self) -> &'static str {
         match self {
             Self::BpfebUnknownNone => "bpfeb-unknown-none",
@@ -28,7 +28,7 @@ struct BuildStd {
     sysroot_dir: PathBuf,
 
     #[arg(long, value_enum)]
-    target: Target,
+    target: StdTarget,
 }
 
 #[derive(clap::Parser)]
