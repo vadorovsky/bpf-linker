@@ -1,4 +1,9 @@
-use std::{ffi::OsString, fs, path::PathBuf, process::Command};
+use std::{
+    ffi::OsString,
+    fs,
+    path::{self, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context as _, Result};
 use rustc_build_sysroot::{BuildMode, SysrootConfig, SysrootStatus};
@@ -39,6 +44,12 @@ struct BuildLlvm {
     /// Build directory.
     #[arg(long)]
     build_dir: PathBuf,
+    /// Target.
+    #[arg(long)]
+    target: Option<String>,
+    /// Use github.com/exein-io/icedragon.
+    #[arg(long)]
+    icedragon: bool,
     /// Directory in which the built LLVM artifacts are installed.
     #[arg(long)]
     install_prefix: PathBuf,
@@ -93,15 +104,56 @@ fn build_llvm(options: BuildLlvm) -> Result<()> {
     let BuildLlvm {
         src_dir,
         build_dir,
+        target,
+        icedragon,
         install_prefix,
     } = options;
 
-    let mut install_arg = OsString::from("-DCMAKE_INSTALL_PREFIX=");
-    install_arg.push(install_prefix.as_os_str());
-    let mut cmake_configure = Command::new("cmake");
-    let cmake_configure = cmake_configure
+    let build_dir = path::absolute(&build_dir).with_context(|| {
+        format!(
+            "failed to make `build_dir` {} absolute",
+            build_dir.display()
+        )
+    })?;
+    let install_prefix = path::absolute(&install_prefix).with_context(|| {
+        format!(
+            "failed to make `install_prefix` {} absolute",
+            install_prefix.display()
+        )
+    })?;
+
+    let mut configure_cmd = if icedragon {
+        let mut configure_cmd = Command::new("icedragon");
+        let _ = configure_cmd.args(["cmake"]);
+        if let Some(ref target) = target {
+            let _ = configure_cmd.arg("--target").arg(target);
+        }
+        let _ = configure_cmd.args([
+            "--",
+            // Directory inside icedragon's container.
+            "-DCMAKE_INSTALL_PREFIX=/llvm-install",
+        ]);
+        configure_cmd
+    } else {
+        let mut configure_cmd = Command::new("cmake");
+
+        let mut install_arg = OsString::from("-DCMAKE_INSTALL_PREFIX=");
+        install_arg.push(install_prefix.as_os_str());
+        let _ = configure_cmd.arg(install_arg);
+
+        if let Some(ref target) = target {
+            let _ = configure_cmd.args([
+                format!("-DCMAKE_ASM_COMPILER_TARGET={target}"),
+                format!("-DCMAKE_C_COMPILER_TARGET={target}"),
+                format!("-DCMAKE_CXX_COMPILER_TARGET={target}"),
+            ]);
+        }
+
+        configure_cmd
+    };
+    let configure_cmd = configure_cmd
         .arg("-S")
-        .arg(src_dir.join("llvm"))
+        .arg("llvm")
         .arg("-B")
         .arg(&build_dir)
         .args([
@@ -119,17 +171,38 @@ fn build_llvm(options: BuildLlvm) -> Result<()> {
             "-DLLVM_TARGETS_TO_BUILD=BPF",
             "-DLLVM_USE_LINKER=lld",
         ])
-        .arg(install_arg);
-    println!("Configuring LLVM with command {cmake_configure:?}");
-    let status = cmake_configure.status().with_context(|| {
-        format!("failed to configure LLVM build with command {cmake_configure:?}")
+        .current_dir(&src_dir);
+    println!("Configuring LLVM with command {configure_cmd:?}");
+    let status = configure_cmd.status().with_context(|| {
+        format!("failed to configure LLVM build with command {configure_cmd:?}")
     })?;
     if !status.success() {
-        anyhow::bail!("failed to configure LLVM build with command {cmake_configure:?}: {status}");
+        anyhow::bail!("failed to configure LLVM build with command {configure_cmd:?}: {status}");
     }
 
-    let mut cmake_build = Command::new("cmake");
-    let cmake_build = cmake_build
+    let mut build_cmd = if icedragon {
+        if !install_prefix.exists() {
+            fs::create_dir_all(&install_prefix).with_context(|| {
+                format!(
+                    "failed to create `install_prefix` {}",
+                    install_prefix.display()
+                )
+            })?;
+        }
+        let mut build_cmd = Command::new("icedragon");
+        let _ = build_cmd.args(["cmake", "--volume"]);
+        let mut volume_arg = install_prefix.clone().into_os_string();
+        volume_arg.push(":/llvm-install");
+        let _ = build_cmd.arg(volume_arg);
+        if let Some(target) = target {
+            let _ = build_cmd.arg("--target").arg(target);
+        }
+        let _ = build_cmd.arg("--");
+        build_cmd
+    } else {
+        Command::new("cmake")
+    };
+    let build_cmd = build_cmd
         .arg("--build")
         .arg(build_dir)
         .args(["--target", "install"])
@@ -140,12 +213,12 @@ fn build_llvm(options: BuildLlvm) -> Result<()> {
         // does not turn those into symlinks-to-symlinks), use absolute
         // symlinks so we can distinguish the two cases.
         .env("CMAKE_INSTALL_MODE", "ABS_SYMLINK");
-    println!("Building LLVM with command {cmake_build:?}");
-    let status = cmake_build
+    println!("Building LLVM with command {build_cmd:?}");
+    let status = build_cmd
         .status()
-        .with_context(|| format!("failed to build LLVM with command {cmake_configure:?}"))?;
+        .with_context(|| format!("failed to build LLVM with command {configure_cmd:?}"))?;
     if !status.success() {
-        anyhow::bail!("failed to configure LLVM build with command {cmake_configure:?}: {status}");
+        anyhow::bail!("failed to configure LLVM build with command {configure_cmd:?}: {status}");
     }
 
     // Move targets over the symlinks that point to them.
