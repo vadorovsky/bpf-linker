@@ -46,3 +46,4 @@ mod linker;
 mod llvm;
 
 pub use linker::*;
+pub use llvm::{LlvmVersionDetectionError, bitcode_llvm_version};

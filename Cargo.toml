@@ -47,6 +47,22 @@ workspace = true
 
 [[bin]]
 name = "bpf-linker"
+path = "src/bin/bpf-linker.rs"
+
+[[bin]]
+name = "bpf-linker-19"
+path = "src/bin/bpf-linker-driver.rs"
+required-features = ["llvm-19"]
+
+[[bin]]
+name = "bpf-linker-20"
+path = "src/bin/bpf-linker-driver.rs"
+required-features = ["llvm-20"]
+
+[[bin]]
+name = "bpf-linker-21"
+path = "src/bin/bpf-linker-driver.rs"
+required-features = ["llvm-21"]
 
 [features]
 llvm-19 = ["dep:llvm-sys-19"]
