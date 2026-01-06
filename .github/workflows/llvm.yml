@@ -9,16 +9,51 @@ permissions:
 
 jobs:
   llvm:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.platform.host-os }}
+    container: ${{ matrix.platform.container }}
     name: llvm
+    strategy:
+      matrix:
+        platform:
+          - host-os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+          - host-os: macos-15-intel
+            target: x86_64-apple-darwin
+            cross: false
+          - host-os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            cross: false
+          - host-os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            cross: true
+            container: ghcr.io/vadorovsky/crossdev:llvm-aarch64-unknown-linux-musl
+            processor: aarch64
+          - host-os: ubuntu-22.04
+            target: riscv64-unknown-linux-musl
+            cross: true
+            container: ghcr.io/vadorovsky/crossdev:llvm-riscv64-unknown-linux-musl
+            processor: riscv64
+          - host-os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          - host-os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            cross: true
+            container: ghcr.io/vadorovsky/crossdev:llvm-x86_64-unknown-linux-musl
+            processor: x86_64
+        llvm:
+          - version: 20
+            git-ref: rustc/20.1-2025-02-13
+          - version: 21
+            git-ref: rustc/21.1-2025-08-01
     env:
-      LLVM_VERSION: 21
       TAG_PREFIX: ghcr.io/${{ github.repository_owner }}/llvm
     steps:
       - id: ls-remote
         run: |
           set -euxo pipefail
-          value=$(git ls-remote https://github.com/aya-rs/llvm-project.git refs/heads/rustc/21.1-2025-08-01 | cut -f1)
+          value=$(git ls-remote https://github.com/aya-rs/llvm-project.git refs/heads/${{ matrix.llvm.git-ref }} | cut -f1)
           echo "sha=$value" >> "$GITHUB_OUTPUT"
 
       - id: sha
@@ -39,7 +74,7 @@ jobs:
         id: artifact-restore
         continue-on-error: true
         run: |
-          oras pull "${{ env.TAG_PREFIX }}:${{ steps.sha.outputs.sha }}"
+          oras pull "${{ env.TAG_PREFIX }}:${{ matrix.llvm.version }}-${{ matrix.platform.target }}"
 
       - uses: actions/checkout@v6
         if: steps.artifact-restore.outcome != 'success'
@@ -48,7 +83,7 @@ jobs:
         if: steps.artifact-restore.outcome != 'success'
 
       - name: Install Tools
-        if: steps.artifact-restore.outcome != 'success'
+        if: steps.artifact-restore.outcome != 'success' && runner.os == 'Linux' && !matrix.platform.container
         run: |
           set -euxo pipefail
           wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | \
@@ -60,6 +95,19 @@ jobs:
           sudo apt update
           sudo apt -y install cmake ninja-build clang lld
 
+      # Install lld, it's faster than Apple ld.
+      - name: Install tools
+        if: steps.artifact-restore.outcome != 'success' && runner.os == 'macOS' && !matrix.platform.container
+        run: |
+          set -euxo pipefail
+          brew install lld
+          echo "$(brew --prefix lld)/bin" >> $GITHUB_PATH
+
+      - name: Add LLVM to PATH
+        if: matrix.platform.container
+        run: |
+          echo /usr/lib/llvm/21/bin >> $GITHUB_PATH
+
       - name: Checkout LLVM Source
         if: steps.artifact-restore.outcome != 'success'
         uses: actions/checkout@v6
@@ -68,14 +116,28 @@ jobs:
           ref: ${{ steps.ls-remote.outputs.sha }}
           path: llvm-project
 
-      - name: Build LLVM
-        if: steps.artifact-restore.outcome != 'success'
+      - name: Build LLVM (native)
+        if: steps.artifact-restore.outcome != 'success' && !matrix.platform.cross
         run: |
           set -euxo pipefail
           cargo xtask build-llvm \
             --src-dir llvm-project \
             --build-dir llvm-build \
             --install-prefix "${{ github.workspace }}/llvm-install"
+
+      - name: Build LLVM (cross)
+        if: steps.artifact-restore.outcome != 'success' && matrix.platform.cross
+        run: |
+          set -euxo pipefail
+          cargo xtask build-llvm \
+            --src-dir llvm-project \
+            --build-dir llvm-build \
+            --install-prefix "${{ github.workspace }}/llvm-install" \
+            --c-compiler "${{ matrix.platform.target }}-clang" \
+            --cxx-compiler "${{ matrix.platform.target }}-clang++" \
+            --processor "${{ matrix.platform.processor }}" \
+            --system-name Linux \
+            --sysroot "/usr/${{ matrix.platform.target }}"
 
       - name: Package LLVM artifact
         if: steps.artifact-restore.outcome != 'success'
@@ -87,8 +149,8 @@ jobs:
         if: steps.artifact-restore.outcome != 'success'
         run: |
           set -euxo pipefail
-          sha_tag="${{ env.TAG_PREFIX }}:${{ steps.sha.outputs.sha }}"
-          version_tag="${{ env.TAG_PREFIX }}:${{ env.LLVM_VERSION }}"
+          sha_tag="${{ env.TAG_PREFIX }}:${{ steps.sha.outputs.sha }}-${{ matrix.platform.target }}"
+          version_tag="${{ env.TAG_PREFIX }}:${{ matrix.llvm.version }}-${{ matrix.platform.target }}"
           oras push "${sha_tag}" \
             --artifact-type application/vnd.aya.llvm.install \
             llvm-install.tar.zst:application/vnd.aya.llvm.install.layer.v1.tar+zstd
