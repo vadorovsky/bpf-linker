@@ -1,8 +1,7 @@
-use std::{ffi::OsString, fs, path::PathBuf, process::Command};
+use std::{ffi::OsString, path::PathBuf, process::Command};
 
 use anyhow::{Context as _, Result};
 use rustc_build_sysroot::{BuildMode, SysrootConfig, SysrootStatus};
-use walkdir::WalkDir;
 
 #[derive(Clone, clap::ValueEnum)]
 enum Target {
@@ -173,49 +172,13 @@ fn build_llvm(options: BuildLlvm) -> Result<()> {
     let cmake_build = cmake_build
         .arg("--build")
         .arg(build_dir)
-        .args(["--target", "install"])
-        // Create symlinks rather than copies to conserve disk space,
-        // especially on GitHub-hosted runners.
-        //
-        // Since the LLVM build creates a bunch of symlinks (and this setting
-        // does not turn those into symlinks-to-symlinks), use absolute
-        // symlinks so we can distinguish the two cases.
-        .env("CMAKE_INSTALL_MODE", "ABS_SYMLINK");
+        .args(["--target", "install"]);
     println!("Building LLVM with command {cmake_build:?}");
     let status = cmake_build
         .status()
         .with_context(|| format!("failed to build LLVM with command {cmake_configure:?}"))?;
     if !status.success() {
         anyhow::bail!("failed to configure LLVM build with command {cmake_configure:?}: {status}");
-    }
-
-    // Move targets over the symlinks that point to them.
-    //
-    // This whole dance would be simpler if CMake supported
-    // `CMAKE_INSTALL_MODE=MOVE`.
-    for entry in WalkDir::new(&install_prefix).follow_links(false) {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to read filesystem entry while traversing install prefix {}",
-                install_prefix.display()
-            )
-        })?;
-        if !entry.file_type().is_symlink() {
-            continue;
-        }
-
-        let link_path = entry.path();
-        let target = fs::read_link(link_path)
-            .with_context(|| format!("failed to read the link {}", link_path.display()))?;
-        if target.is_absolute() {
-            fs::rename(&target, link_path).with_context(|| {
-                format!(
-                    "failed to move the target file {} to the location of the symlink {}",
-                    target.display(),
-                    link_path.display()
-                )
-            })?;
-        }
     }
 
     Ok(())
