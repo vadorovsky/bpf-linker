@@ -221,10 +221,10 @@ jobs:
         if: matrix.llvm-from == 'source'
         run: |
           set -euxo pipefail
-          echo "${{ github.workspace }}/llvm-install/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/llvm-install/bin" >> $GITHUB_PATH
           # LD_LIBRARY_PATH is needed because we're going to link everything dynamically below. This
           # doesn't affect behavior, but greatly reduces disk usage.
-          echo "LD_LIBRARY_PATH=${{ github.workspace }}/llvm-install/lib" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/llvm-install/lib" >> $GITHUB_ENV
 
       # llvm-sys discovers link flags at build script time; these are cached by cargo. The cached
       # flags may be incorrect when the cache is reused across LLVM versions.
@@ -280,7 +280,7 @@ jobs:
           set -euxo pipefail
 
           RUSTC_SRC="$(rustc --print sysroot)/lib/rustlib/src/rust/library"
-          BPFEL_SYSROOT_DIR="${{ github.workspace }}/bpf-sysroot"
+          BPFEL_SYSROOT_DIR="$GITHUB_WORKSPACE/bpf-sysroot"
           RUSTC_BOOTSTRAP=1 cargo xtask build-std \
             --rustc-src "$RUSTC_SRC" \
             --sysroot-dir "$BPFEL_SYSROOT_DIR" \
@@ -289,7 +289,7 @@ jobs:
       - name: Test (prebuilt BPF standard libary, dynamic linking)
         if: matrix.platform.dynamic-target || matrix.llvm-from != 'rust-ci'
         run: |
-          BPFEL_SYSROOT_DIR="${{ github.workspace }}/bpf-sysroot" \
+          BPFEL_SYSROOT_DIR="$GITHUB_WORKSPACE/bpf-sysroot" \
             cargo hack test --feature-powerset --exclude-features \
             ${{ env.LLVM_EXCLUDE_FEATURES_DYNAMIC }},${{ matrix.toolchain.exclude-features }} \
             --features ${{ env.LLVM_FEATURES_DYNAMIC }}
@@ -356,7 +356,7 @@ jobs:
 
       - name: Test (prebuilt BPF standard library, static linking)
         run: |
-          BPFEL_SYSROOT_DIR="${{ github.workspace }}/bpf-sysroot" \
+          BPFEL_SYSROOT_DIR="$GITHUB_WORKSPACE/bpf-sysroot" \
             cargo test --no-default-features --features \
             ${{ env.LLVM_FEATURES_STATIC }}
 

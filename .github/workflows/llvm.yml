@@ -66,4 +66,4 @@ jobs:
           cargo xtask build-llvm \
             --src-dir llvm-project \
             --build-dir llvm-build \
-            --install-prefix "${{ github.workspace }}/llvm-install"
+            --install-prefix "$GITHUB_WORKSPACE/llvm-install"
