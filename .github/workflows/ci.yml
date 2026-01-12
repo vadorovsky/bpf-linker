@@ -252,7 +252,7 @@ jobs:
           cargo clean -p llvm-sys
           cargo clean -p llvm-sys --release
 
-      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo install cargo-hack
 
       - name: Check (dynamic linking, feature powerset)
         if: matrix.platform.dynamic-target || matrix.llvm-from != 'rust-ci'
