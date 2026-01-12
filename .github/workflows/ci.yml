@@ -53,6 +53,7 @@ jobs:
       contents: read
       packages: read
     runs-on: ${{ matrix.platform.os }}
+    container: ${{ matrix.platform.container }}
     # We work with two git repositories in this workflow:
     #
     # - bpf-linker
@@ -89,29 +90,21 @@ jobs:
           # target. Linux GNU targets come with dynamic ones. Apple and Linux
           # musl targets come with static ones.
           - os: macos-latest
-            static-target: aarch64-apple-darwin
+            target: aarch64-apple-darwin
           - os: macos-15-intel
-            static-target: x86_64-apple-darwin
+            target: x86_64-apple-darwin
           # We don't use ubuntu-latest because we care about the apt packages available.
           - os: ubuntu-22.04
-            dynamic-target: x86_64-unknown-linux-gnu
-            static-target: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            container: ghcr.io/vadorovsky/crossdev:llvm-x86_64-unknown-linux-musl
           - os: ubuntu-22.04-arm
-            dynamic-target: aarch64-unknown-linux-gnu
-            static-target: aarch64-unknown-linux-musl
-        llvm-from:
-          - packages
-          - rust-ci
-        include:
-          # Currently we build LLVM from source only for Linux x86_64.
-          - toolchain:
-              rust: nightly
-              llvm: 21
-              exclude-features: llvm-20,rust-llvm-20
-            platform:
-              os: ubuntu-22.04
-            llvm-from: source
-    name: os=${{ matrix.platform.os }} rustc=${{ matrix.toolchain.rust }} llvm-version=${{ matrix.toolchain.llvm }} llvm-from=${{ matrix.llvm-from }}
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            container: ghcr.io/vadorovsky/crossdev:llvm-aarch64-unknown-linux-musl
+    name: target=${{ matrix.platform.target }} rustc=${{ matrix.toolchain.rust }} llvm-version=${{ matrix.toolchain.llvm }}
     needs: llvm
 
     env:
@@ -123,8 +116,6 @@ jobs:
       # Features that have to be excluded when running `cargo hack --feature-powerset`
       # and intending to link dynamically.
       LLVM_EXCLUDE_FEATURES_DYNAMIC: llvm-link-static,no-llvm-linking
-      RUSTC_LLVM_INSTALL_DIR_DYNAMIC: /tmp/rustc-llvm-dynamic
-      RUSTC_LLVM_INSTALL_DIR_STATIC: /tmp/rustc-llvm-static
 
     steps:
       - uses: actions/checkout@v6
@@ -135,10 +126,11 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain.rust }}
+          targets: ${{ matrix.platform.target }}
           components: rust-src
 
       - name: Add clang to PATH
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.platform.container
         # ubuntu-22.04 comes with clang 13-15[0]; support for signed and 64bit
         # enum values was added in clang 15[1] which isn't in `$PATH`.
         #
@@ -147,79 +139,62 @@ jobs:
         # [1] https://github.com/llvm/llvm-project/commit/dc1c43d
         run: echo /usr/lib/llvm-15/bin >> $GITHUB_PATH
 
+      - name: Add clang to PATH
+        # Gentoo comes with clang 21 as default.
+        if: runner.os == 'Linux' && matrix.platform.container
+        run: echo /usr/lib/llvm/21/bin >> $GITHUB_PATH
+
+      - name: Enforce dynamic linking, set cargo runner
+        if: ${{ endsWith(matrix.platform.target, 'musl') }}
+        # Historically, Rust used to enforce static linkage of runtime
+        # (`-C target-feature=+crt-static`) on all musl targets. Currently this
+        # behavior is being phased out in favor of defaulting to dynamic
+        # linking[0][1][2], but it's not yet consistently applied to all Rust
+        # versions and all musl targets.
+        #
+        # We want dynamic linking to save space, especially during `cargo hack`
+        # runs.
+        #
+        # We also need to use the musl dynamic linker from the sysroot, with
+        # appropriate library paths, as a runner for tests.
+        #
+        # [0] https://github.com/rust-lang/compiler-team/issues/422
+        # [1] https://github.com/rust-lang/rust/pull/133386
+        # [2] https://github.com/rust-lang/rust/pull/144513
+        run: |
+          set -euxo pipefail
+
+          echo "RUSTFLAGS=-C target-feature=-crt-static" >> $GITHUB_ENV
+
+          sysroot="/usr/${{ matrix.platform.target }}"
+          ld_musl="${sysroot}/lib/ld-musl-$(arch).so.1"
+          library_paths=(
+            "/lib"
+            "/usr/lib"
+            "/usr/lib64"
+            "/usr/lib/llvm/21/lib"
+          )
+          library_paths=( "${library_paths[@]/#/$sysroot}" )
+          IFS=:
+          library_paths="${library_paths[*]}"
+          unset IFS
+          cat >> .cargo/config.toml <<EOF
+          [target.${{ matrix.platform.target }}]
+          runner = "${ld_musl} --library-path ${library_paths}"
+          EOF
+
       - name: Check (default features, no system LLVM)
-        run: cargo check
+        run: cargo check --target "${{ matrix.platform.target }}"
 
       - name: Build (default features, no system LLVM)
-        run: cargo build
+        run: cargo build --target "${{ matrix.platform.target }}"
 
       - name: Install btfdump
         run: cargo install btfdump
 
-      - name: Install LLVM (Linux, packages)
-        if: matrix.llvm-from == 'packages' && runner.os == 'Linux'
-        run: |
-          set -euxo pipefail
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo -e deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ matrix.toolchain.llvm }} main | sudo tee /etc/apt/sources.list.d/llvm.list
-
-          sudo apt update
-          sudo apt -y install llvm-${{ matrix.toolchain.llvm }}-dev
-          echo /usr/lib/llvm-${{ matrix.toolchain.llvm }}/bin >> $GITHUB_PATH
-
-      - name: Install LLVM (macOS, packages)
-        if: matrix.llvm-from == 'packages' && runner.os == 'macOS'
-        run: |
-          set -euxo pipefail
-          brew install llvm@${{ matrix.toolchain.llvm }}
-          echo $(brew --prefix llvm@${{ matrix.toolchain.llvm }})/bin >> $GITHUB_PATH
-          # DYLD_LIBRARY_PATH is needed because we're going to link everything dynamically below. This
-          # doesn't affect behavior, but greatly reduces disk usage.
-          echo "DYLD_LIBRARY_PATH=$(brew --prefix llvm@${{ matrix.toolchain.llvm }})/lib" >> $GITHUB_ENV
-
-      - name: Install LLVM from Rust CI
-        if: matrix.llvm-from == 'rust-ci'
-        run: |
-          set -euxo pipefail
-          mkdir -p $RUSTC_LLVM_INSTALL_DIR_DYNAMIC $RUSTC_LLVM_INSTALL_DIR_STATIC
-
-          download_llvm() {
-            local target_triple=$1
-            local install_dir=$2
-
-            local url
-            url="$(./scripts/rust-ci-rust-dev-url.sh "$target_triple")"
-            echo "Downloading $url"
-            wget -q -O - "$url" | tar -xJ --strip-components 2 -C "$install_dir"
-          }
-
-          if [[ -n "${{ matrix.platform['dynamic-target'] }}" ]]; then
-            download_llvm \
-              "${{ matrix.platform['dynamic-target'] }}" \
-              "${RUSTC_LLVM_INSTALL_DIR_DYNAMIC}"
-            # LD_LIBRARY_PATH is needed because we're going to link everything dynamically below. This
-            # doesn't affect behavior, but greatly reduces disk usage.
-            echo "LD_LIBRARY_PATH=${RUSTC_LLVM_INSTALL_DIR_DYNAMIC}/lib" >> $GITHUB_ENV
-            # We start with steps that use dynamic linking. Add llvm-config
-            # associated with dynamic target to `PATH`.
-            echo "${RUSTC_LLVM_INSTALL_DIR_DYNAMIC}/bin" >> $GITHUB_PATH
-          fi
-          if [[ -n "${{ matrix.platform['static-target'] }}" ]]; then
-            download_llvm \
-              "${{ matrix.platform['static-target'] }}" \
-              "${RUSTC_LLVM_INSTALL_DIR_STATIC}"
-            if [[ "${{ runner.os }}" == "Linux" ]]; then
-              # `FileCheck` binary shipped in musl tarballs is linked dynamically
-              # to musl, we can't execute it on Ubuntu.
-              rm -f "${RUSTC_LLVM_INSTALL_DIR_STATIC}/bin/FileCheck"
-            fi
-          fi
-
       - uses: oras-project/setup-oras@v1
-        if: matrix.llvm-from == 'source'
 
       - name: Login to ghcr.io
-        if: matrix.llvm-from == 'source'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -227,22 +202,21 @@ jobs:
           oras login ghcr.io --username "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN"
 
       - name: Restore LLVM from ghcr.io
-        if: matrix.llvm-from == 'source'
         run: |
           set -euxo pipefail
-          oras pull "ghcr.io/${{ github.repository_owner }}/llvm:${{ matrix.toolchain.llvm }}"
-          mkdir -p llvm-install
-          tar --zstd -xf llvm-install.tar.zst -C llvm-install
+          oras pull "ghcr.io/${{ github.repository_owner }}/llvm:${{ matrix.toolchain.llvm }}-${{ matrix.platform.target }}"
+          mkdir -p "$GITHUB_WORKSPACE/llvm-install"
+          tar --zstd -xf llvm-install.tar.zst -C "$GITHUB_WORKSPACE/llvm-install"
           rm -f llvm-install.tar.zst
-
-      - name: Add LLVM to PATH && LD_LIBRARY_PATH
-        if: matrix.llvm-from == 'source'
-        run: |
-          set -euxo pipefail
           echo "$GITHUB_WORKSPACE/llvm-install/bin" >> $GITHUB_PATH
-          # LD_LIBRARY_PATH is needed because we're going to link everything dynamically below. This
+          # {DYLIB,LD}_LIBRARY_PATH is needed because we're going to link everything dynamically below. This
           # doesn't affect behavior, but greatly reduces disk usage.
-          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/llvm-install/lib" >> $GITHUB_ENV
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            dylib_env_prefix=DYLD
+          else
+            dylib_env_prefix=LD
+          fi
+          echo "${dylib_env_prefix}_LIBRARY_PATH=$GITHUB_WORKSPACE/llvm-install/lib" >> $GITHUB_ENV
 
       # llvm-sys discovers link flags at build script time; these are cached by cargo. The cached
       # flags may be incorrect when the cache is reused across LLVM versions.
@@ -255,18 +229,18 @@ jobs:
       - run: cargo install cargo-hack
 
       - name: Check (dynamic linking, feature powerset)
-        if: matrix.platform.dynamic-target || matrix.llvm-from != 'rust-ci'
         run: |
           cargo hack check --feature-powerset --exclude-features \
             ${{ env.LLVM_EXCLUDE_FEATURES_DYNAMIC }},${{ matrix.toolchain.exclude-features }} \
-            --features ${{ env.LLVM_FEATURES_DYNAMIC }}
+            --features ${{ env.LLVM_FEATURES_DYNAMIC }} \
+            --target "${{ matrix.platform.target }}"
 
       - name: Build (dynamic linking, feature powerset)
-        if: matrix.platform.dynamic-target || matrix.llvm-from != 'rust-ci'
         run: |
           cargo hack build --feature-powerset --exclude-features \
             ${{ env.LLVM_EXCLUDE_FEATURES_DYNAMIC }},${{ matrix.toolchain.exclude-features }} \
-            --features ${{ env.LLVM_FEATURES_DYNAMIC }}
+            --features ${{ env.LLVM_FEATURES_DYNAMIC }} \
+            --target "${{ matrix.platform.target }}"
 
       # Toolchains provided by rustup include standard library artifacts
       # only for Tier 1 targets, which do not include BPF targets.
@@ -277,12 +251,12 @@ jobs:
       #
       # `RUSTC_BOOTSTRAP` is needed to use `rustc-build-sysroot` on stable Rust.
       - name: Test (sysroot built on demand, dynamic linking)
-        if: matrix.platform.dynamic-target || matrix.llvm-from != 'rust-ci'
         run: |
           RUSTC_BOOTSTRAP=1 cargo hack test --feature-powerset \
             --exclude-features \
             ${{ env.LLVM_EXCLUDE_FEATURES_DYNAMIC }},${{ matrix.toolchain.exclude-features }} \
-            --features ${{ env.LLVM_FEATURES_DYNAMIC }}
+            --features ${{ env.LLVM_FEATURES_DYNAMIC }} \
+            --target "${{ matrix.platform.target }}"
 
       # To make things easier for package maintainers, the step of building a
       # custom sysroot can be skipped by setting the `BPFEL_SYSROOT_DIR`
@@ -305,12 +279,12 @@ jobs:
             --target bpfel-unknown-none
 
       - name: Test (prebuilt BPF standard libary, dynamic linking)
-        if: matrix.platform.dynamic-target || matrix.llvm-from != 'rust-ci'
         run: |
           BPFEL_SYSROOT_DIR="$GITHUB_WORKSPACE/bpf-sysroot" \
             cargo hack test --feature-powerset --exclude-features \
             ${{ env.LLVM_EXCLUDE_FEATURES_DYNAMIC }},${{ matrix.toolchain.exclude-features }} \
-            --features ${{ env.LLVM_FEATURES_DYNAMIC }}
+            --features ${{ env.LLVM_FEATURES_DYNAMIC }} \
+            --target "${{ matrix.platform.target }}"
 
       - uses: actions/checkout@v6
         if: runner.os == 'Linux' && matrix.toolchain.rust == 'nightly'
@@ -320,7 +294,7 @@ jobs:
           submodules: recursive
 
       - name: Install
-        if: runner.os == 'Linux' && matrix.toolchain.rust == 'nightly'
+        if: runner.os == 'Linux' && !matrix.platform.container && matrix.toolchain.rust == 'nightly'
         run: |
           cargo install --path . --no-default-features --features \
             ${{ env.LLVM_FEATURES_DYNAMIC }}
@@ -330,11 +304,6 @@ jobs:
         working-directory: aya
         run: cargo xtask integration-test local
 
-      - name: Prepare for static linking (LLVM from Rust CI)
-        if: matrix.llvm-from == 'rust-ci'
-        run: |
-          echo "${RUSTC_LLVM_INSTALL_DIR_STATIC}/bin" >> $GITHUB_PATH
-
       - name: Install static libraries (macOS)
         if: runner.os == 'macOS'
         # macOS does not provide any static libraries. Homebrew does provide
@@ -342,17 +311,16 @@ jobs:
         # Point build.rs to them by setting environment variables.
         #
         # We install llvm package only for libc++.
-        #
-        # libLLVM from homebrew requires zstd.
         run: |
           set -euxo pipefail
-          brew install llvm zlib
+          brew install llvm zlib zstd
           echo "CXXSTDLIB_PATH=$(brew --prefix llvm)/lib/c++" >> $GITHUB_ENV
           echo "ZLIB_PATH=$(brew --prefix zlib)/lib" >> $GITHUB_ENV
-          if [[ "${{ matrix.llvm-from }}" == "packages" ]]; then
-            brew install zstd
-            echo "LIBZSTD_PATH=$(brew --prefix zstd)/lib" >> $GITHUB_ENV
-          fi
+          echo "LIBZSTD_PATH=$(brew --prefix zstd)/lib" >> $GITHUB_ENV
+
+      - name: Enforce static linking
+        run: |
+          echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
 
       - name: Check (static linking, single feature set)
         # Static linking in combination with `cargo hack --feature-powerset`
@@ -360,23 +328,27 @@ jobs:
         # perform all static builds with only one fixed feature set.
         run: |
           cargo check --no-default-features --features \
-            ${{ env.LLVM_FEATURES_STATIC }}
+            ${{ env.LLVM_FEATURES_STATIC }} \
+            --target "${{ matrix.platform.target }}"
 
       - name: Build (static linking, single feature set)
         run: |
           cargo build --no-default-features --features \
-            ${{ env.LLVM_FEATURES_STATIC }}
+            ${{ env.LLVM_FEATURES_STATIC }} \
+            --target "${{ matrix.platform.target }}"
 
       - name: Test (sysroot built on demand, static linking)
         run: |
           RUSTC_BOOTSTRAP=1 cargo test --no-default-features --features \
-            ${{ env.LLVM_FEATURES_STATIC }}
+            ${{ env.LLVM_FEATURES_STATIC }} \
+            --target "${{ matrix.platform.target }}"
 
       - name: Test (prebuilt BPF standard library, static linking)
         run: |
           BPFEL_SYSROOT_DIR="$GITHUB_WORKSPACE/bpf-sysroot" \
             cargo test --no-default-features --features \
-            ${{ env.LLVM_FEATURES_STATIC }}
+            ${{ env.LLVM_FEATURES_STATIC }} \
+            --target "${{ matrix.platform.target }}"
 
       - name: Report disk usage
         if: ${{ always() }}
