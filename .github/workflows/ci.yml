@@ -166,22 +166,22 @@ jobs:
 
           echo "RUSTFLAGS=-C target-feature=-crt-static" >> $GITHUB_ENV
 
-          sysroot="/usr/${{ matrix.platform.target }}"
-          ld_musl="${sysroot}/lib/ld-musl-$(arch).so.1"
-          library_paths=(
-            "/lib"
-            "/usr/lib"
-            "/usr/lib64"
-            "/usr/lib/llvm/21/lib"
-          )
-          library_paths=( "${library_paths[@]/#/$sysroot}" )
-          IFS=:
-          library_paths="${library_paths[*]}"
-          unset IFS
-          cat >> .cargo/config.toml <<EOF
-          [target.${{ matrix.platform.target }}]
-          runner = "${ld_musl} --library-path ${library_paths}"
-          EOF
+          # sysroot="/usr/${{ matrix.platform.target }}"
+          # ld_musl="${sysroot}/lib/ld-musl-$(arch).so.1"
+          # library_paths=(
+          #   "/lib"
+          #   "/usr/lib"
+          #   "/usr/lib64"
+          #   "/usr/lib/llvm/21/lib"
+          # )
+          # library_paths=( "${library_paths[@]/#/$sysroot}" )
+          # IFS=:
+          # library_paths="${library_paths[*]}"
+          # unset IFS
+          # cat >> .cargo/config.toml <<EOF
+          # [target.${{ matrix.platform.target }}]
+          # runner = "${ld_musl} --library-path ${library_paths}"
+          # EOF
 
       - name: Check (default features, no system LLVM)
         run: cargo check --target "${{ matrix.platform.target }}"
