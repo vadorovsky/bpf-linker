@@ -1,4 +1,5 @@
 use std::{
+    array,
     borrow::Cow,
     env,
     ffi::{OsStr, OsString},
@@ -158,22 +159,41 @@ where
     }
 }
 
-fn check_library<S: Display>(
+fn find_and_link_libraries<const N: usize>(
     stdout: &mut io::StdoutLock<'_>,
     ld_paths: &OsStr,
-    library: S,
-    paths: Option<Vec<PathBuf>>,
+    libraries: &[Library<'_>; N],
 ) -> anyhow::Result<()> {
-    if let Some(paths) = paths {
-        match paths.as_slice() {
+    // Collecions of all library candidate paths. Might contain duplicates if
+    // a library is present in different directories from `ld_paths`.
+    let mut library_paths: [_; N] = array::from_fn(|_| Vec::new());
+    for ld_path in env::split_paths(ld_paths) {
+        for (i, library) in libraries.iter().enumerate() {
+            for (_, filename) in library.iter_static_filenames() {
+                let library_path = ld_path.join(filename);
+                if library_path.try_exists().with_context(|| {
+                    format!("failed to inspect the file {}", library_path.display())
+                })? {
+                    library_paths[i].push(library_path);
+                }
+            }
+        }
+    }
+    // Check whether each library has at least one candidate path. If not,
+    // return an error. If a library has more than one candidate, pick the
+    // first one and emit a warning.
+    // Emit the appropriate Cargo instructions to link the found liraries.
+    for (i, library) in libraries.iter().enumerate() {
+        let library_paths = &library_paths[i];
+        let library_path = match library_paths.as_slice() {
             [] => {
                 anyhow::bail!(
                     "could not find {library} in any of the following directories: {}",
                     ld_paths.display()
-                );
+                )
             }
-            [_] => {}
-            paths => {
+            [path] => path,
+            paths @ [path, ..] => {
                 let mut hashes = std::collections::HashMap::new();
                 let mut buffer = [0; 8 * 1024];
                 for path in paths {
@@ -215,7 +235,19 @@ fn check_library<S: Display>(
                     }
                     writeln!(stdout)?;
                 }
+                path
             }
+        };
+        let library_dir = library_path
+            .parent()
+            .expect("`library_path` should have a parent");
+        write_bytes!(
+            stdout,
+            "cargo:rust-link-search=",
+            library_dir.as_os_str().as_bytes()
+        )?;
+        for library in library.iter() {
+            write_bytes!(stdout, "cargo:rust-link-lib=static=", library)?;
         }
     }
     Ok(())
@@ -457,64 +489,13 @@ to an appropriate compiler"
         // - C++ standard library
         // - zlib (if needed)
         // - zstd (if needed)
-        const ZLIB: &str = "libz.a";
-        const ZSTD: &str = "libzstd.a";
-        let mut cxxstdlib_paths = (!cxxstdlib_found).then(Vec::new);
-        let mut zlib_paths = (needs_zlib && !zlib_found).then(Vec::new);
-        let mut zstd_paths = (needs_zstd && !zstd_found).then(Vec::new);
-        for ld_path in env::split_paths(ld_paths) {
-            let mut found_any = false;
-            if let Some(ref mut cxxstdlib_paths) = cxxstdlib_paths {
-                for (_, cxxstdlib) in cxxstdlib.iter_static_filenames() {
-                    let cxxstdlib_path = ld_path.join(cxxstdlib);
-                    if cxxstdlib_path.try_exists().with_context(|| {
-                        format!("failed to inspect the file {}", cxxstdlib_path.display(),)
-                    })? {
-                        cxxstdlib_paths.push(cxxstdlib_path);
-                        found_any = true;
-                    }
-                }
-            }
-            if let Some(ref mut zlib_paths) = zlib_paths {
-                let zlib_path = ld_path.join(ZLIB);
-                if zlib_path.try_exists().with_context(|| {
-                    format!("failed to inspect the file {}", zlib_path.display())
-                })? {
-                    zlib_paths.push(zlib_path);
-                    found_any = true;
-                }
-            }
-            if let Some(ref mut zstd_paths) = zstd_paths {
-                let zstd_path = ld_path.join("libzstd.a");
-                if zstd_path.try_exists().with_context(|| {
-                    format!("failed to inspect the file {}", zstd_path.display())
-                })? {
-                    zstd_paths.push(zstd_path);
-                    found_any = true;
-                }
-            }
-            if found_any {
-                write_bytes!(
-                    stdout,
-                    "cargo:rustc-link-search=",
-                    ld_path.as_os_str().as_bytes(),
-                )?;
-            }
-        }
-
-        check_library(stdout, ld_paths, &cxxstdlib, cxxstdlib_paths)?;
-        check_library(stdout, ld_paths, ZLIB, zlib_paths)?;
-        check_library(stdout, ld_paths, ZSTD, zstd_paths)?;
-    }
-
-    for cxxstdlib in cxxstdlib.iter() {
-        write_bytes!(stdout, "cargo:rustc-link-lib=static=", cxxstdlib)?;
-    }
-    if needs_zlib {
-        write_bytes!(stdout, "cargo:rustc-link-lib=static=z")?;
-    }
-    if needs_zstd {
-        write_bytes!(stdout, "cargo:rustc-link-lib=static=zstd")?;
+        const ZLIB: &[u8] = b"z";
+        const ZSTD: &[u8] = b"zstd";
+        find_and_link_libraries(
+            stdout,
+            ld_paths,
+            &[cxxstdlib, Library::Single(ZLIB), Library::Single(ZSTD)],
+        )?;
     }
 
     Ok(())
