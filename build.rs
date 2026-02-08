@@ -159,11 +159,12 @@ where
 }
 
 /// Checks whether the given environment variable `env_var` exists and if yes,
-/// emits its content as a search path for the linker.
+/// searches for the given `library` in it and links it.
 ///
 /// Returns a boolean indicating whether the variable was found
-fn emit_search_path_if_defined(
+fn find_and_link_libary_in_defined_path(
     stdout: &mut io::StdoutLock<'_>,
+    library: &Library<'_>,
     env_var: &str,
 ) -> anyhow::Result<bool> {
     writeln!(stdout, "cargo:rerun-if-env-changed={env_var}")?;
@@ -174,6 +175,14 @@ fn emit_search_path_if_defined(
                 "cargo:rustc-link-search=",
                 path.as_os_str().as_bytes(),
             )?;
+            for (library, filename) in library.iter_static_filenames() {
+                let library_path = Path::new(&path).join(filename);
+                if library_path.try_exists().with_context(|| {
+                    format!("failed to inspect the file {}", library_path.display())
+                })? {
+                    write_bytes!(stdout, "cargo:rustc-link-lib=static=", library)?;
+                }
+            }
             Ok(true)
         }
         None => Ok(false),
@@ -267,6 +276,10 @@ fn link_llvm_static(stdout: &mut io::StdoutLock<'_>, llvm_lib_dir: PathBuf) -> a
     }
 
     let cxxstdlib = Library::cxxstdlib(stdout)?;
+    const ZLIB: &[u8] = b"z";
+    let zlib = Library::Single(ZLIB);
+    const ZSTD: &[u8] = b"zstd";
+    let zstd = Library::Single(ZSTD);
 
     // Find directories with static libraries we're interested in:
     // - C++ standard library
@@ -275,9 +288,12 @@ fn link_llvm_static(stdout: &mut io::StdoutLock<'_>, llvm_lib_dir: PathBuf) -> a
 
     // Check whether custom paths were provided. If yes, point the linker to
     // them.
-    let cxxstdlib_found = emit_search_path_if_defined(stdout, "CXXSTDLIB_PATH")?;
-    let zlib_found = needs_zlib && emit_search_path_if_defined(stdout, "ZLIB_PATH")?;
-    let zstd_found = needs_zstd && emit_search_path_if_defined(stdout, "LIBZSTD_PATH")?;
+    let cxxstdlib_found =
+        find_and_link_libary_in_defined_path(stdout, &cxxstdlib, "CXXSTDLIB_PATH")?;
+    let zlib_found =
+        needs_zlib && find_and_link_libary_in_defined_path(stdout, &zlib, "ZLIB_PATH")?;
+    let zstd_found =
+        needs_zstd && find_and_link_libary_in_defined_path(stdout, &zstd, "LIBZSTD_PATH")?;
 
     if !cxxstdlib_found || (needs_zlib && !zlib_found) || (needs_zstd && !zstd_found) {
         // Unfortunately, Rust/cargo don't look for static libraries in system
