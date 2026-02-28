@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+WRAPPER_DIR=$(dirname -- "$0")
+export CARGO_BUILD_TARGET=aarch64-unknown-linux-musl
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$(realpath "${WRAPPER_DIR}/aarch64-linux-musl-clang")
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=$(realpath "${WRAPPER_DIR}/aarch64-linux-musl-run")
+
+exec cargo "$@"
