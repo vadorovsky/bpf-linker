@@ -7,7 +7,7 @@ use std::{
     ptr,
 };
 
-use gimli::{DW_TAG_pointer_type, DW_TAG_structure_type, DW_TAG_union_type, DW_TAG_variant_part};
+use gimli::{DW_TAG_structure_type, DW_TAG_union_type, DW_TAG_variant_part};
 use llvm_sys::{core::*, debuginfo::*, prelude::*};
 use tracing::{Level, span, trace, warn};
 
@@ -132,11 +132,18 @@ impl<'ctx> DISanitizer<'ctx> {
                     _ => (),
                 }
             }
+            // LLVM cleans up names of pointer types on its own since 21.1.8:
+            //
+            // https://github.com/llvm/llvm-project/pull/163174
+            // https://github.com/llvm/llvm-project/pull/165154 (backport to 21.x)
+            //
+            // We need to perform a manual clean up only for LLVM 20.
+            #[cfg(feature = "llvm-20")]
             Metadata::DIDerivedType(mut di_derived_type) => {
                 #[expect(clippy::single_match)]
                 #[expect(non_upper_case_globals)]
                 match di_derived_type.tag() {
-                    DW_TAG_pointer_type => {
+                    gimli::DW_TAG_pointer_type => {
                         // remove rust names
                         di_derived_type.replace_name(self.context, &[])
                     }
