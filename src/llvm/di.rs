@@ -7,11 +7,13 @@ use std::{
     ptr,
 };
 
-use gimli::{DW_TAG_structure_type, DW_TAG_union_type, DW_TAG_variant_part};
+use gimli::{DW_TAG_structure_type, DW_TAG_union_type};
 use llvm_sys::{core::*, debuginfo::*, prelude::*};
 use tracing::{Level, span, trace, warn};
 
 use super::types::ir::{Function, MDNode, Metadata, Value};
+#[cfg(feature = "llvm-20")]
+use crate::llvm::types::di::DICompositeType;
 use crate::llvm::{LLVMContext, LLVMModule, iter::*, types::di::DISubprogram};
 
 // KSYM_NAME_LEN from linux kernel intentionally set
@@ -68,6 +70,51 @@ impl<'ctx> DISanitizer<'ctx> {
         }
     }
 
+    #[cfg(feature = "llvm-20")]
+    fn sanitize_data_carrying_enum(
+        &mut self,
+        names: &Option<(Vec<u8>, Vec<u8>)>,
+        di_composite_type: &mut DICompositeType<'_>,
+    ) {
+        let mut is_data_carrying_enum = false;
+        for element in di_composite_type.elements() {
+            match element {
+                Metadata::DICompositeType(di_composite_type_inner) => {
+                    // The presence of a composite type with `DW_TAG_variant_part`
+                    // as a member of another composite type means that we are
+                    // processing a data-carrying enum. Such types are not supported
+                    // by the Linux kernel. We need to remove the children, so BTF
+                    // doesn't contain data carried by the enum variant.
+                    #[expect(non_upper_case_globals)]
+                    match di_composite_type_inner.tag() {
+                        gimli::DW_TAG_variant_part => {
+                            if let Some((name, _)) = names {
+                                let file = di_composite_type.file();
+                                let name = String::from_utf8_lossy(name.as_slice()).to_string();
+                                trace!(
+                                    "found data carrying enum {name} ({filename}:{line}), not emitting the debug info for it",
+                                    filename = file
+                                        .filename()
+                                        .map_or("<unknown>".into(), String::from_utf8_lossy),
+                                    line = di_composite_type.line(),
+                                );
+                                self.skipped_types_lossy.push(name);
+                            }
+
+                            is_data_carrying_enum = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if is_data_carrying_enum {
+            di_composite_type.replace_elements(MDNode::empty(self.context));
+        }
+    }
+
     fn visit_mdnode(&mut self, mdnode: MDNode<'_>) {
         match mdnode.try_into().expect("MDNode is not Metadata") {
             Metadata::DICompositeType(mut di_composite_type) => {
@@ -86,44 +133,9 @@ impl<'ctx> DISanitizer<'ctx> {
                             return;
                         }
 
-                        let mut is_data_carrying_enum = false;
-                        for element in di_composite_type.elements() {
-                            match element {
-                                Metadata::DICompositeType(di_composite_type_inner) => {
-                                    // The presence of a composite type with `DW_TAG_variant_part`
-                                    // as a member of another composite type means that we are
-                                    // processing a data-carrying enum. Such types are not supported
-                                    // by the Linux kernel. We need to remove the children, so BTF
-                                    // doesn't contain data carried by the enum variant.
-                                    match di_composite_type_inner.tag() {
-                                        DW_TAG_variant_part => {
-                                            if let Some((ref name, _)) = names {
-                                                let file = di_composite_type.file();
-                                                let name = String::from_utf8_lossy(name.as_slice())
-                                                    .to_string();
-                                                trace!(
-                                                    "found data carrying enum {name} ({filename}:{line}), not emitting the debug info for it",
-                                                    filename = file.filename().map_or(
-                                                        "<unknown>".into(),
-                                                        String::from_utf8_lossy
-                                                    ),
-                                                    line = di_composite_type.line(),
-                                                );
-                                                self.skipped_types_lossy.push(name);
-                                            }
+                        #[cfg(feature = "llvm-20")]
+                        self.sanitize_data_carrying_enum(&names, &mut di_composite_type);
 
-                                            is_data_carrying_enum = true;
-                                            break;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if is_data_carrying_enum {
-                            di_composite_type.replace_elements(MDNode::empty(self.context));
-                        }
                         if let Some((_, sanitized_name)) = names {
                             // Clear the name from characters incompatible with C.
                             di_composite_type.replace_name(self.context, sanitized_name.as_slice())
