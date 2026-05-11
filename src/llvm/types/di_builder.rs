@@ -1,31 +1,33 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, ptr::NonNull};
 
 use llvm_sys::{
+    LLVMOpaqueDIBuilder,
     core::LLVMMetadataAsValue,
     debuginfo::{
         LLVMCreateDIBuilder, LLVMDIBuilderCreateFunction, LLVMDIBuilderFinalizeSubprogram,
         LLVMDisposeDIBuilder,
     },
-    prelude::{LLVMDIBuilderRef, LLVMMetadataRef},
+    prelude::LLVMMetadataRef,
 };
 
 use crate::llvm::{
     LLVMContext, LLVMModule,
-    types::{di::DISubprogram, ir::ValueLike as _},
+    types::{LLVMTypeError, di::DISubprogram, ir::ValueLike as _},
 };
 
 pub(crate) struct DIBuilder<'ctx> {
-    builder: LLVMDIBuilderRef,
+    builder: NonNull<LLVMOpaqueDIBuilder>,
     _marker: PhantomData<&'ctx ()>,
 }
 
 impl<'ctx> DIBuilder<'ctx> {
-    pub(crate) fn new(module: &'ctx LLVMModule<'ctx>) -> Self {
+    pub(crate) fn new(module: &'ctx LLVMModule<'ctx>) -> Result<Self, LLVMTypeError> {
         let builder = unsafe { LLVMCreateDIBuilder(module.as_mut_ptr()) };
-        Self {
+        let builder = NonNull::new(builder).ok_or_else(|| LLVMTypeError::NullPtr("DIBuilder"))?;
+        Ok(Self {
             builder,
             _marker: PhantomData,
-        }
+        })
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -50,7 +52,7 @@ impl<'ctx> DIBuilder<'ctx> {
 
         let subprogram = unsafe {
             LLVMDIBuilderCreateFunction(
-                self.builder,
+                self.builder.as_ptr(),
                 scope,
                 name.cast(),
                 name_len,
@@ -76,7 +78,7 @@ impl<'ctx> DIBuilder<'ctx> {
     pub(crate) fn finalize_subprogram(&self, subprogram: &DISubprogram<'_>) {
         unsafe {
             LLVMDIBuilderFinalizeSubprogram(
-                self.builder,
+                self.builder.as_ptr(),
                 llvm_sys::core::LLVMValueAsMetadata(subprogram.value.as_ptr()),
             )
         };
@@ -85,6 +87,6 @@ impl<'ctx> DIBuilder<'ctx> {
 
 impl Drop for DIBuilder<'_> {
     fn drop(&mut self) {
-        unsafe { LLVMDisposeDIBuilder(self.builder) };
+        unsafe { LLVMDisposeDIBuilder(self.builder.as_ptr()) };
     }
 }

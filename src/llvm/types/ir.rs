@@ -93,14 +93,14 @@ pub(crate) fn replace_name(
 pub(crate) enum Value<'ctx> {
     MDNode(MDNode<'ctx>),
     Function(Function<'ctx>),
-    Other(LLVMValueRef),
+    Other(NonNull<LLVMValue>),
 }
 
 impl std::fmt::Debug for Value<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let value_to_string = |value| {
+        let value_to_string = |value: NonNull<LLVMValue>| {
             Message {
-                ptr: unsafe { LLVMPrintValueToString(value) },
+                ptr: unsafe { LLVMPrintValueToString(value.as_ptr()) },
             }
             .as_string_lossy()
             .to_string()
@@ -108,11 +108,11 @@ impl std::fmt::Debug for Value<'_> {
         match self {
             Self::MDNode(node) => f
                 .debug_struct("MDNode")
-                .field("value", &value_to_string(node.value_ref))
+                .field("value", &value_to_string(node.value))
                 .finish(),
             Self::Function(fun) => f
                 .debug_struct("Function")
-                .field("value", &value_to_string(fun.value_ref))
+                .field("value", &value_to_string(fun.value))
                 .finish(),
             Self::Other(value) => f
                 .debug_struct("Other")
@@ -123,20 +123,23 @@ impl std::fmt::Debug for Value<'_> {
 }
 
 impl Value<'_> {
-    pub(crate) fn new(value: LLVMValueRef) -> Self {
-        if unsafe { !LLVMIsAMDNode(value).is_null() } {
-            let mdnode = unsafe { MDNode::from_value_ref(value) };
-            return Value::MDNode(mdnode);
-        } else if unsafe { !LLVMIsAFunction(value).is_null() } {
-            return Value::Function(unsafe { Function::from_value_ref(value) });
-        }
-        Value::Other(value)
+    pub(crate) fn from_raw(value: LLVMValueRef) -> Result<Self, LLVMTypeError> {
+        let value = NonNull::new(value).ok_or_else(|| LLVMTypeError::NullPtr("Value"))?;
+        Ok(if unsafe { !LLVMIsAMDNode(value.as_ptr()).is_null() } {
+            let mdnode = unsafe { MDNode::from_non_null(value) };
+            Value::MDNode(mdnode)
+        } else if unsafe { !LLVMIsAFunction(value.as_ptr()).is_null() } {
+            let function = unsafe { Function::from_non_null(value) };
+            Value::Function(function)
+        } else {
+            Value::Other(value)
+        })
     }
 
     pub(crate) fn metadata_entries(&self) -> Option<MetadataEntries> {
         let value = match self {
-            Value::MDNode(node) => node.value_ref,
-            Value::Function(f) => f.value_ref,
+            Value::MDNode(node) => node.value,
+            Value::Function(f) => f.value,
             Value::Other(value) => *value,
         };
         MetadataEntries::new(value)
@@ -144,9 +147,11 @@ impl Value<'_> {
 
     pub(crate) fn operands(&self) -> Option<impl Iterator<Item = LLVMValueRef>> {
         let value = match self {
-            Value::MDNode(node) => Some(node.value_ref),
-            Value::Function(f) => Some(f.value_ref),
-            Value::Other(value) if unsafe { !LLVMIsAUser(*value).is_null() } => Some(*value),
+            Value::MDNode(node) => Some(node.value.as_ptr()),
+            Value::Function(f) => Some(f.value.as_ptr()),
+            Value::Other(value) if unsafe { !LLVMIsAUser(value.as_ptr()).is_null() } => {
+                Some(value.as_ptr())
+            }
             _ => None,
         };
 
@@ -246,16 +251,14 @@ impl Metadata<'_> {
 impl<'ctx> From<MDNode<'ctx>> for Metadata<'ctx> {
     fn from(md_node: MDNode<'_>) -> Self {
         // SAFETY: `MDNode` is a subclass of `Metadata`.
-        unsafe {
-            Self::from_raw(md_node.value_ref).expect("MDNode's `value_ref` should not be null")
-        }
+        unsafe { Self::from_non_null(md_node.value) }
     }
 }
 
 /// Represents a metadata node.
 #[derive(Clone)]
 pub(crate) struct MDNode<'ctx> {
-    pub(super) value_ref: LLVMValueRef,
+    pub(super) value: NonNull<LLVMValue>,
     _marker: PhantomData<&'ctx ()>,
 }
 
@@ -268,19 +271,27 @@ impl MDNode<'_> {
     /// instance of [LLVM `MDNode`](https://llvm.org/doxygen/classllvm_1_1MDNode.html).
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any valiation checks.
-    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+    pub(crate) unsafe fn from_raw(value_ref: LLVMValueRef) -> Result<Self, LLVMTypeError> {
+        let value_ref = NonNull::new(value_ref).ok_or_else(|| LLVMTypeError::NullPtr("MDNode"))?;
+        Ok(Self {
+            value: value_ref,
+            _marker: PhantomData,
+        })
+    }
+
+    unsafe fn from_non_null(value: NonNull<LLVMValue>) -> Self {
         Self {
-            value_ref,
+            value,
             _marker: PhantomData,
         }
     }
 
     /// Constructs an empty metadata node.
-    pub(crate) fn empty(context: &LLVMContext) -> Self {
+    pub(crate) fn empty(context: &LLVMContext) -> Result<Self, LLVMTypeError> {
         let metadata =
             unsafe { LLVMMDNodeInContext2(context.as_mut_ptr(), core::ptr::null_mut(), 0) };
         let value = unsafe { LLVMMetadataAsValue(context.as_mut_ptr(), metadata) };
-        unsafe { Self::from_value_ref(value) }
+        unsafe { Self::from_raw(value) }
     }
 
     /// Constructs a new metadata node from an array of [`DIType`] elements.
@@ -288,7 +299,10 @@ impl MDNode<'_> {
     /// This function is used to create composite metadata structures, such as
     /// arrays or tuples of different types or values, which can then be used
     /// to represent complex data structures within the metadata system.
-    pub(crate) fn with_elements(context: &LLVMContext, elements: &[DIType<'_>]) -> Self {
+    pub(crate) fn with_elements(
+        context: &LLVMContext,
+        elements: &[DIType<'_>],
+    ) -> Result<Self, LLVMTypeError> {
         let metadata = unsafe {
             let mut elements: Vec<LLVMMetadataRef> = elements
                 .iter()
@@ -301,28 +315,26 @@ impl MDNode<'_> {
             )
         };
         let value = unsafe { LLVMMetadataAsValue(context.as_mut_ptr(), metadata) };
-        unsafe { Self::from_value_ref(value) }
+        unsafe { Self::from_raw(value) }
     }
 }
 
 pub(crate) struct MetadataEntries {
-    entries: *mut LLVMValueMetadataEntry,
+    entries: NonNull<LLVMValueMetadataEntry>,
     count: u32,
 }
 
 impl MetadataEntries {
-    pub(crate) fn new(v: LLVMValueRef) -> Option<Self> {
-        if unsafe { LLVMIsAGlobalObject(v).is_null() && LLVMIsAInstruction(v).is_null() } {
+    pub(crate) fn new(v: NonNull<LLVMValue>) -> Option<Self> {
+        if unsafe {
+            LLVMIsAGlobalObject(v.as_ptr()).is_null() && LLVMIsAInstruction(v.as_ptr()).is_null()
+        } {
             return None;
         }
 
         let mut count = 0;
-        let entries = unsafe { LLVMGlobalCopyAllMetadata(v, &mut count) };
-        if entries.is_null() {
-            return None;
-        }
-
-        Some(Self {
+        let entries = unsafe { LLVMGlobalCopyAllMetadata(v.as_ptr(), &mut count) };
+        NonNull::new(entries).map(|entries| Self {
             entries,
             count: count.try_into().unwrap(),
         })
@@ -332,8 +344,8 @@ impl MetadataEntries {
         let Self { entries, count } = self;
         (0..*count).map(|index| unsafe {
             (
-                LLVMValueMetadataEntriesGetMetadata(*entries, index),
-                LLVMValueMetadataEntriesGetKind(*entries, index),
+                LLVMValueMetadataEntriesGetMetadata(entries.as_ptr(), index),
+                LLVMValueMetadataEntriesGetKind(entries.as_ptr(), index),
             )
         })
     }
@@ -342,7 +354,7 @@ impl MetadataEntries {
 impl Drop for MetadataEntries {
     fn drop(&mut self) {
         unsafe {
-            LLVMDisposeValueMetadataEntries(self.entries);
+            LLVMDisposeValueMetadataEntries(self.entries.as_ptr());
         }
     }
 }
@@ -368,7 +380,7 @@ impl Iterator for BasicBlockIter<'_> {
 /// Represents a function.
 #[derive(Clone)]
 pub(crate) struct Function<'ctx> {
-    pub value_ref: LLVMValueRef,
+    pub value: NonNull<LLVMValue>,
     _marker: PhantomData<&'ctx ()>,
 }
 
@@ -381,27 +393,35 @@ impl<'ctx> Function<'ctx> {
     /// instance of [LLVM `Function`](https://llvm.org/doxygen/classllvm_1_1Function.html).
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any valiation checks.
-    pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
+    pub(crate) unsafe fn from_raw(value_ref: LLVMValueRef) -> Result<Self, LLVMTypeError> {
+        let value = NonNull::new(value_ref).ok_or_else(|| LLVMTypeError::NullPtr("Function"))?;
+        Ok(Self {
+            value,
+            _marker: PhantomData,
+        })
+    }
+
+    unsafe fn from_non_null(value: NonNull<LLVMValue>) -> Self {
         Self {
-            value_ref,
+            value,
             _marker: PhantomData,
         }
     }
 
     pub(crate) fn name(&self) -> &[u8] {
-        symbol_name(self.value_ref)
+        symbol_name(self.value.as_ptr())
     }
 
     pub(crate) fn params(&self) -> impl Iterator<Item = LLVMValueRef> {
-        let params_count = unsafe { LLVMCountParams(self.value_ref) };
-        let value = self.value_ref;
+        let value = self.value.as_ptr();
+        let params_count = unsafe { LLVMCountParams(value) };
         (0..params_count).map(move |i| unsafe { LLVMGetParam(value, i) })
     }
 
     pub(crate) fn basic_blocks(&self) -> impl Iterator<Item = LLVMBasicBlockRef> + '_ {
         // SAFETY: We are sure that the provided `LLVMValueRef` is a
         // `Function`.
-        let current = unsafe { LLVMGetFirstBasicBlock(self.value_ref) };
+        let current = unsafe { LLVMGetFirstBasicBlock(self.value.as_ptr()) };
         let current = NonNull::new(current).map(|function| function.as_ptr());
         BasicBlockIter {
             current,
@@ -410,7 +430,7 @@ impl<'ctx> Function<'ctx> {
     }
 
     pub(crate) fn subprogram(&self, context: LLVMContextRef) -> Option<DISubprogram<'ctx>> {
-        let subprogram = unsafe { LLVMGetSubprogram(self.value_ref) };
+        let subprogram = unsafe { LLVMGetSubprogram(self.value.as_ptr()) };
         (!subprogram.is_null()).then(|| unsafe {
             DISubprogram::from_raw(LLVMMetadataAsValue(context, subprogram)).expect(
                 "subprogram belonging to a non-null function should be a correct non-null pointer",
@@ -421,7 +441,7 @@ impl<'ctx> Function<'ctx> {
     pub(crate) fn set_subprogram(&mut self, subprogram: &DISubprogram<'_>) {
         unsafe {
             LLVMSetSubprogram(
-                self.value_ref,
+                self.value.as_ptr(),
                 LLVMValueAsMetadata(subprogram.value.as_ptr()),
             )
         };

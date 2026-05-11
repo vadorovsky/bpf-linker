@@ -2,7 +2,7 @@ use std::{marker::PhantomData, ptr::NonNull, slice};
 
 use gimli::DwTag;
 use llvm_sys::{
-    LLVMValue,
+    LLVMOpaqueMetadata, LLVMValue,
     core::{
         LLVMGetNumOperands, LLVMGetOperand, LLVMIsAValueAsMetadata, LLVMReplaceMDNodeOperandWith,
         LLVMValueAsMetadata,
@@ -17,7 +17,10 @@ use llvm_sys::{
 
 use crate::llvm::{
     LLVMContext, LLVMGetMDString,
-    types::ir::{MDNode, Metadata, ValueLike},
+    types::{
+        LLVMTypeError,
+        ir::{MDNode, Metadata, ValueLike},
+    },
 };
 
 fn mdstring<'a>(mdstring: LLVMValueRef) -> &'a [u8] {
@@ -46,7 +49,7 @@ unsafe fn di_node_tag(metadata_ref: LLVMMetadataRef) -> DwTag {
 /// A `DIFile` debug info node, which represents a given file, is referenced by
 /// other debug info nodes which belong to the file.
 pub(crate) struct DIFile<'ctx> {
-    pub(super) metadata_ref: LLVMMetadataRef,
+    pub(super) metadata: NonNull<LLVMOpaqueMetadata>,
     _marker: PhantomData<&'ctx ()>,
 }
 
@@ -59,11 +62,12 @@ impl DIFile<'_> {
     /// instance of [LLVM `DIFile`](https://llvm.org/doxygen/classllvm_1_1DIFile.html).
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any validation checks.
-    pub(crate) unsafe fn from_metadata_ref(metadata_ref: LLVMMetadataRef) -> Self {
-        Self {
-            metadata_ref,
+    pub(crate) unsafe fn from_raw(metadata: LLVMMetadataRef) -> Result<Self, LLVMTypeError> {
+        let metadata = NonNull::new(metadata).ok_or_else(|| LLVMTypeError::NullPtr("DIFile"))?;
+        Ok(Self {
+            metadata,
             _marker: PhantomData,
-        }
+        })
     }
 
     pub(crate) fn filename(&self) -> Option<&[u8]> {
@@ -74,7 +78,7 @@ impl DIFile<'_> {
         //
         // Therefore, we don't need to call `LLVMDisposeMessage`. The memory
         // gets freed when calling `LLVMDisposeDIBuilder`.
-        let ptr = unsafe { LLVMDIFileGetFilename(self.metadata_ref, &mut len) };
+        let ptr = unsafe { LLVMDIFileGetFilename(self.metadata.as_ptr(), &mut len) };
         (!ptr.is_null()).then(|| unsafe { slice::from_raw_parts(ptr.cast(), len as usize) })
     }
 }
@@ -127,7 +131,7 @@ impl DIType<'_> {
     /// instance of [LLVM `DIType`](https://llvm.org/doxygen/classllvm_1_1DIType.html).
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any validation checks.
-    pub(crate) unsafe fn from_non_null(value: NonNull<LLVMValue>) -> Self {
+    unsafe fn from_non_null(value: NonNull<LLVMValue>) -> Self {
         Self {
             value,
             _marker: PhantomData,
@@ -279,10 +283,10 @@ impl DICompositeType<'_> {
     }
 
     /// Returns the file that the composite type belongs to.
-    pub(crate) fn file(&self) -> DIFile<'_> {
+    pub(crate) fn file(&self) -> Result<DIFile<'_>, LLVMTypeError> {
         unsafe {
             let metadata = LLVMDIScopeGetFile(LLVMValueAsMetadata(self.value.as_ptr()));
-            DIFile::from_metadata_ref(metadata)
+            DIFile::from_raw(metadata)
         }
     }
 
@@ -305,7 +309,7 @@ impl DICompositeType<'_> {
             LLVMReplaceMDNodeOperandWith(
                 self.value.as_ptr(),
                 DICompositeTypeOperand::Elements as u32,
-                LLVMValueAsMetadata(mdnode.value_ref),
+                LLVMValueAsMetadata(mdnode.value.as_ptr()),
             )
         }
     }

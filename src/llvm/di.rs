@@ -60,7 +60,7 @@ impl<'ctx> DISanitizer<'ctx> {
         DISanitizer {
             context,
             module,
-            builder: DIBuilder::new(module),
+            builder: DIBuilder::new(module).expect("new DIBuilder should not be NULL"),
             visited_nodes: HashSet::new(),
             replace_operands: HashMap::new(),
             skipped_types_lossy: Vec::new(),
@@ -99,7 +99,9 @@ impl<'ctx> DISanitizer<'ctx> {
                                     match di_composite_type_inner.tag() {
                                         DW_TAG_variant_part => {
                                             if let Some((ref name, _)) = names {
-                                                let file = di_composite_type.file();
+                                                let file = di_composite_type
+                                                    .file()
+                                                    .expect("file should not be NULL");
                                                 let name = String::from_utf8_lossy(name.as_slice())
                                                     .to_string();
                                                 trace!(
@@ -126,11 +128,14 @@ impl<'ctx> DISanitizer<'ctx> {
                             }
                         }
                         if is_data_carrying_enum {
-                            di_composite_type.replace_elements(MDNode::empty(self.context));
+                            di_composite_type.replace_elements(
+                                MDNode::empty(self.context).expect("new MDNode should not be NULL"),
+                            );
                         } else if !members.is_empty() {
                             members.sort_by_cached_key(|di_type| di_type.offset_in_bits());
                             let sorted_elements =
-                                MDNode::with_elements(self.context, members.as_mut_slice());
+                                MDNode::with_elements(self.context, members.as_mut_slice())
+                                    .expect("new MDNode should not be null");
                             di_composite_type.replace_elements(sorted_elements);
                         }
                         if let Some((_, sanitized_name)) = names {
@@ -176,7 +181,7 @@ impl<'ctx> DISanitizer<'ctx> {
             // An operand with no value is valid and means that the operand is
             // not set
             (v, Item::Operand { .. }) if v.is_null() => return,
-            (v, _) if !v.is_null() => Value::new(v),
+            (v, _) if !v.is_null() => Value::from_raw(v).expect("new value should not be NULL"),
             // All other items should have values
             (_, item) => panic!("{item:?} has no value"),
         };
@@ -281,7 +286,7 @@ impl<'ctx> DISanitizer<'ctx> {
         for mut function in self
             .module
             .functions()
-            .map(|value| unsafe { Function::from_value_ref(value) })
+            .map(|value| unsafe { Function::from_raw(value).expect("function should not be NULL") })
         {
             if export_symbols.contains(function.name()) {
                 continue;
