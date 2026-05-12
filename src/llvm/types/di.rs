@@ -110,7 +110,6 @@ unsafe fn di_type_name<'a>(metadata_ref: LLVMMetadataRef) -> Option<&'a [u8]> {
 
 /// Represents the debug information for a primitive type in LLVM IR.
 pub(crate) struct DIType<'ctx> {
-    pub(super) metadata_ref: LLVMMetadataRef,
     pub(super) value_ref: LLVMValueRef,
     _marker: PhantomData<&'ctx ()>,
 }
@@ -125,9 +124,7 @@ impl DIType<'_> {
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any validation checks.
     pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
-        let metadata_ref = unsafe { LLVMValueAsMetadata(value_ref) };
         Self {
-            metadata_ref,
             value_ref,
             _marker: PhantomData,
         }
@@ -136,7 +133,7 @@ impl DIType<'_> {
     /// Returns the offset of the type in bits. This offset is used in case the
     /// type is a member of a composite type.
     pub(crate) fn offset_in_bits(&self) -> u64 {
-        unsafe { LLVMDITypeGetOffsetInBits(self.metadata_ref) }
+        unsafe { LLVMDITypeGetOffsetInBits(LLVMValueAsMetadata(self.value_ref)) }
     }
 }
 
@@ -152,7 +149,6 @@ impl<'ctx> From<DIDerivedType<'ctx>> for DIType<'ctx> {
 /// alternative name. The examples of derived types are pointers, references,
 /// typedefs, etc.
 pub(crate) struct DIDerivedType<'ctx> {
-    metadata_ref: LLVMMetadataRef,
     value_ref: LLVMValueRef,
     _marker: PhantomData<&'ctx ()>,
 }
@@ -167,9 +163,7 @@ impl DIDerivedType<'_> {
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any validation checks.
     pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
-        let metadata_ref = unsafe { LLVMValueAsMetadata(value_ref) };
         Self {
-            metadata_ref,
             value_ref,
             _marker: PhantomData,
         }
@@ -192,7 +186,7 @@ impl DIDerivedType<'_> {
 
     /// Returns a DWARF tag of the given derived type.
     pub(crate) fn tag(&self) -> DwTag {
-        unsafe { di_node_tag(self.metadata_ref) }
+        unsafe { di_node_tag(LLVMValueAsMetadata(self.value_ref)) }
     }
 }
 
@@ -216,7 +210,6 @@ enum DICompositeTypeOperand {
 /// Composite type is a kind of type that can include other types, such as
 /// structures, enums, unions, etc.
 pub(crate) struct DICompositeType<'ctx> {
-    metadata_ref: LLVMMetadataRef,
     value_ref: LLVMValueRef,
     _marker: PhantomData<&'ctx ()>,
 }
@@ -231,9 +224,7 @@ impl DICompositeType<'_> {
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any validation checks.
     pub(crate) unsafe fn from_value_ref(value_ref: LLVMValueRef) -> Self {
-        let metadata_ref = unsafe { LLVMValueAsMetadata(value_ref) };
         Self {
-            metadata_ref,
             value_ref,
             _marker: PhantomData,
         }
@@ -257,25 +248,25 @@ impl DICompositeType<'_> {
 
     /// Returns the name of the composite type.
     pub(crate) fn name(&self) -> Option<&[u8]> {
-        unsafe { di_type_name(self.metadata_ref) }
+        unsafe { di_type_name(LLVMValueAsMetadata(self.value_ref)) }
     }
 
     /// Returns the file that the composite type belongs to.
     pub(crate) fn file(&self) -> DIFile<'_> {
         unsafe {
-            let metadata = LLVMDIScopeGetFile(self.metadata_ref);
+            let metadata = LLVMDIScopeGetFile(LLVMValueAsMetadata(self.value_ref));
             DIFile::from_metadata_ref(metadata)
         }
     }
 
     /// Returns the flags associated with the composity type.
     pub(crate) fn flags(&self) -> LLVMDIFlags {
-        unsafe { LLVMDITypeGetFlags(self.metadata_ref) }
+        unsafe { LLVMDITypeGetFlags(LLVMValueAsMetadata(self.value_ref)) }
     }
 
     /// Returns the line number in the source code where the type is defined.
     pub(crate) fn line(&self) -> u32 {
-        unsafe { LLVMDITypeGetLine(self.metadata_ref) }
+        unsafe { LLVMDITypeGetLine(LLVMValueAsMetadata(self.value_ref)) }
     }
 
     /// Replaces the elements of the composite type with a new metadata node.
@@ -309,7 +300,7 @@ impl DICompositeType<'_> {
 
     /// Returns a DWARF tag of the given composite type.
     pub(crate) fn tag(&self) -> DwTag {
-        unsafe { di_node_tag(self.metadata_ref) }
+        unsafe { di_node_tag(LLVMValueAsMetadata(self.value_ref)) }
     }
 }
 
