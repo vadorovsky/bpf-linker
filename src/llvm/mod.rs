@@ -11,7 +11,6 @@ use std::{
 };
 
 pub(crate) use di::DISanitizer;
-use iter::IterModuleGlobalAliases as _;
 use llvm_sys::{
     LLVMAttributeFunctionIndex, LLVMLinkage, LLVMVisibility,
     bit_reader::LLVMParseBitcodeInContext2,
@@ -237,7 +236,7 @@ pub(crate) fn optimize(
     for sym in module.globals() {
         internalize(sym, symbol_name(sym), export_symbols);
     }
-    for sym in module.as_mut_ptr().global_aliases_iter() {
+    for sym in module.global_aliases() {
         internalize(sym, symbol_name(sym), export_symbols);
     }
 

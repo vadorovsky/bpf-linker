@@ -5,16 +5,15 @@ use llvm_sys::{
     bit_writer::LLVMWriteBitcodeToFile,
     core::{
         LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMessage, LLVMDisposeModule,
-        LLVMGetFirstFunction, LLVMGetFirstGlobal, LLVMGetNextFunction, LLVMGetNextGlobal,
-        LLVMGetTarget, LLVMPrintModuleToFile, LLVMPrintModuleToString,
+        LLVMGetFirstFunction, LLVMGetFirstGlobal, LLVMGetFirstGlobalAlias, LLVMGetNextFunction,
+        LLVMGetNextGlobal, LLVMGetNextGlobalAlias, LLVMGetTarget, LLVMPrintModuleToFile,
+        LLVMPrintModuleToString,
     },
     debuginfo::LLVMStripModuleDebugInfo,
     prelude::{LLVMModuleRef, LLVMValueRef},
 };
 
-use crate::llvm::{
-    MemoryBuffer, Message, iter::IterModuleGlobalAliases as _, types::context::LLVMContext,
-};
+use crate::llvm::{MemoryBuffer, Message, types::context::LLVMContext};
 
 pub(crate) struct FunctionIter<'ctx> {
     current: Option<LLVMValueRef>,
@@ -48,6 +47,24 @@ impl Iterator for GlobalIter<'_> {
             // global.
             let current = unsafe { LLVMGetNextGlobal(global) };
             self.current = NonNull::new(current).map(|global| global.as_ptr());
+        })
+    }
+}
+
+pub(crate) struct GlobalAliasIter<'ctx> {
+    current: Option<LLVMValueRef>,
+    _lifetime: PhantomData<&'ctx ()>,
+}
+
+impl Iterator for GlobalAliasIter<'_> {
+    type Item = LLVMValueRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.current.inspect(|&global_alias| {
+            // SAFETY: We are sure that the provided `LLVMValueRef` is a
+            // global alias.
+            let current = unsafe { LLVMGetNextGlobalAlias(global_alias) };
+            self.current = NonNull::new(current).map(|global_alias| global_alias.as_ptr());
         })
     }
 }
@@ -144,7 +161,13 @@ impl LLVMModule<'_> {
     }
 
     pub(crate) fn global_aliases(&self) -> impl Iterator<Item = LLVMValueRef> {
-        self.module.global_aliases_iter()
+        // SAFETY: We are sure that the provided `LLVMValueRef` is a module.
+        let current = unsafe { LLVMGetFirstGlobalAlias(self.module) };
+        let current = NonNull::new(current).map(|global_alias| global_alias.as_ptr());
+        GlobalAliasIter {
+            current,
+            _lifetime: PhantomData,
+        }
     }
 }
 
