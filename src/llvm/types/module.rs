@@ -5,17 +5,15 @@ use llvm_sys::{
     bit_writer::LLVMWriteBitcodeToFile,
     core::{
         LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMessage, LLVMDisposeModule,
-        LLVMGetFirstFunction, LLVMGetNextFunction, LLVMGetTarget, LLVMPrintModuleToFile,
-        LLVMPrintModuleToString,
+        LLVMGetFirstFunction, LLVMGetFirstGlobal, LLVMGetNextFunction, LLVMGetNextGlobal,
+        LLVMGetTarget, LLVMPrintModuleToFile, LLVMPrintModuleToString,
     },
     debuginfo::LLVMStripModuleDebugInfo,
     prelude::{LLVMModuleRef, LLVMValueRef},
 };
 
 use crate::llvm::{
-    MemoryBuffer, Message,
-    iter::{IterModuleGlobalAliases as _, IterModuleGlobals as _},
-    types::context::LLVMContext,
+    MemoryBuffer, Message, iter::IterModuleGlobalAliases as _, types::context::LLVMContext,
 };
 
 pub(crate) struct FunctionIter<'ctx> {
@@ -32,6 +30,24 @@ impl Iterator for FunctionIter<'_> {
             // function.
             let current = unsafe { LLVMGetNextFunction(function) };
             self.current = NonNull::new(current).map(|function| function.as_ptr());
+        })
+    }
+}
+
+pub(crate) struct GlobalIter<'ctx> {
+    current: Option<LLVMValueRef>,
+    _lifetime: PhantomData<&'ctx ()>,
+}
+
+impl Iterator for GlobalIter<'_> {
+    type Item = LLVMValueRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.current.inspect(|&global| {
+            // SAFETY: We are sure that the provided `LLVMValueRef` is a
+            // global.
+            let current = unsafe { LLVMGetNextGlobal(global) };
+            self.current = NonNull::new(current).map(|global| global.as_ptr());
         })
     }
 }
@@ -118,7 +134,13 @@ impl LLVMModule<'_> {
     }
 
     pub(crate) fn globals(&self) -> impl Iterator<Item = LLVMValueRef> {
-        self.module.globals_iter()
+        // SAFETY: We are sure that the provided `LLVMValueRef` is a module.
+        let current = unsafe { LLVMGetFirstGlobal(self.module) };
+        let current = NonNull::new(current).map(|global| global.as_ptr());
+        GlobalIter {
+            current,
+            _lifetime: PhantomData,
+        }
     }
 
     pub(crate) fn global_aliases(&self) -> impl Iterator<Item = LLVMValueRef> {
