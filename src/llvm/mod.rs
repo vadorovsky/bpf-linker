@@ -11,7 +11,7 @@ use std::{
 };
 
 pub(crate) use di::DISanitizer;
-use iter::{IterModuleFunctions as _, IterModuleGlobalAliases as _, IterModuleGlobals as _};
+use iter::{IterModuleGlobalAliases as _, IterModuleGlobals as _};
 use llvm_sys::{
     LLVMAttributeFunctionIndex, LLVMLinkage, LLVMVisibility,
     bit_reader::LLVMParseBitcodeInContext2,
@@ -241,7 +241,7 @@ pub(crate) fn optimize(
         internalize(sym, symbol_name(sym), export_symbols);
     }
 
-    for function in module.as_mut_ptr().functions_iter() {
+    for function in module.functions() {
         let name = symbol_name(function);
         if !name.starts_with(b"llvm.") {
             if ignore_inline_never {

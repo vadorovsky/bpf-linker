@@ -2,10 +2,10 @@ use std::marker::PhantomData;
 
 use llvm_sys::{
     core::{
-        LLVMGetFirstBasicBlock, LLVMGetFirstFunction, LLVMGetFirstGlobal, LLVMGetFirstGlobalAlias,
-        LLVMGetFirstInstruction, LLVMGetLastBasicBlock, LLVMGetLastFunction, LLVMGetLastGlobal,
-        LLVMGetLastGlobalAlias, LLVMGetLastInstruction, LLVMGetNextBasicBlock, LLVMGetNextFunction,
-        LLVMGetNextGlobal, LLVMGetNextGlobalAlias, LLVMGetNextInstruction,
+        LLVMGetFirstBasicBlock, LLVMGetFirstGlobal, LLVMGetFirstGlobalAlias,
+        LLVMGetFirstInstruction, LLVMGetLastBasicBlock, LLVMGetLastGlobal, LLVMGetLastGlobalAlias,
+        LLVMGetLastInstruction, LLVMGetNextBasicBlock, LLVMGetNextGlobal, LLVMGetNextGlobalAlias,
+        LLVMGetNextInstruction,
     },
     prelude::{LLVMBasicBlockRef, LLVMModuleRef, LLVMValueRef},
 };
@@ -77,17 +77,6 @@ llvm_iterator! {
     LLVMGetFirstGlobalAlias,
     LLVMGetLastGlobalAlias,
     LLVMGetNextGlobalAlias,
-}
-
-llvm_iterator! {
-    IterModuleFunctions,
-    FunctionsIter,
-    LLVMModuleRef,
-    functions_iter,
-    LLVMValueRef,
-    LLVMGetFirstFunction,
-    LLVMGetLastFunction,
-    LLVMGetNextFunction,
 }
 
 llvm_iterator!(

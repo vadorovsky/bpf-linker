@@ -1,11 +1,12 @@
-use std::{ffi::CStr, marker::PhantomData};
+use std::{ffi::CStr, marker::PhantomData, ptr::NonNull};
 
 use libc::c_char;
 use llvm_sys::{
     bit_writer::LLVMWriteBitcodeToFile,
     core::{
         LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMessage, LLVMDisposeModule,
-        LLVMGetTarget, LLVMPrintModuleToFile, LLVMPrintModuleToString,
+        LLVMGetFirstFunction, LLVMGetNextFunction, LLVMGetTarget, LLVMPrintModuleToFile,
+        LLVMPrintModuleToString,
     },
     debuginfo::LLVMStripModuleDebugInfo,
     prelude::{LLVMModuleRef, LLVMValueRef},
@@ -13,9 +14,27 @@ use llvm_sys::{
 
 use crate::llvm::{
     MemoryBuffer, Message,
-    iter::{IterModuleFunctions as _, IterModuleGlobalAliases as _, IterModuleGlobals as _},
+    iter::{IterModuleGlobalAliases as _, IterModuleGlobals as _},
     types::context::LLVMContext,
 };
+
+pub(crate) struct FunctionIter<'ctx> {
+    current: Option<LLVMValueRef>,
+    _lifetime: PhantomData<&'ctx ()>,
+}
+
+impl Iterator for FunctionIter<'_> {
+    type Item = LLVMValueRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.current.inspect(|&function| {
+            // SAFETY: We are sure that the provided `LLVMValueRef` is a
+            // function.
+            let current = unsafe { LLVMGetNextFunction(function) };
+            self.current = NonNull::new(current).map(|function| function.as_ptr());
+        })
+    }
+}
 
 pub(crate) struct LLVMModule<'ctx> {
     pub(super) module: LLVMModuleRef,
@@ -89,7 +108,13 @@ impl LLVMModule<'_> {
     }
 
     pub(crate) fn functions(&self) -> impl Iterator<Item = LLVMValueRef> {
-        self.module.functions_iter()
+        // SAFETY: We are sure that the provided `LLVMValueRef` is a module.
+        let current = unsafe { LLVMGetFirstFunction(self.module) };
+        let current = NonNull::new(current).map(|function| function.as_ptr());
+        FunctionIter {
+            current,
+            _lifetime: PhantomData,
+        }
     }
 
     pub(crate) fn globals(&self) -> impl Iterator<Item = LLVMValueRef> {
