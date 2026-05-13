@@ -1,13 +1,13 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, ptr::NonNull};
 
 use llvm_sys::{
     core::{
-        LLVMCountParams, LLVMDisposeValueMetadataEntries, LLVMGetNumOperands, LLVMGetOperand,
-        LLVMGetParam, LLVMGlobalCopyAllMetadata, LLVMIsAFunction, LLVMIsAGlobalObject,
-        LLVMIsAInstruction, LLVMIsAMDNode, LLVMIsAUser, LLVMMDNodeInContext2,
-        LLVMMDStringInContext2, LLVMMetadataAsValue, LLVMPrintValueToString,
-        LLVMReplaceMDNodeOperandWith, LLVMValueAsMetadata, LLVMValueMetadataEntriesGetKind,
-        LLVMValueMetadataEntriesGetMetadata,
+        LLVMCountParams, LLVMDisposeValueMetadataEntries, LLVMGetFirstBasicBlock,
+        LLVMGetNextBasicBlock, LLVMGetNumOperands, LLVMGetOperand, LLVMGetParam,
+        LLVMGlobalCopyAllMetadata, LLVMIsAFunction, LLVMIsAGlobalObject, LLVMIsAInstruction,
+        LLVMIsAMDNode, LLVMIsAUser, LLVMMDNodeInContext2, LLVMMDStringInContext2,
+        LLVMMetadataAsValue, LLVMPrintValueToString, LLVMReplaceMDNodeOperandWith,
+        LLVMValueAsMetadata, LLVMValueMetadataEntriesGetKind, LLVMValueMetadataEntriesGetMetadata,
     },
     debuginfo::{LLVMGetMetadataKind, LLVMGetSubprogram, LLVMMetadataKind, LLVMSetSubprogram},
     prelude::{
@@ -16,9 +16,7 @@ use llvm_sys::{
 };
 
 use crate::llvm::{
-    LLVMContext, Message,
-    iter::IterBasicBlocks as _,
-    symbol_name,
+    LLVMContext, Message, symbol_name,
     types::di::{DICompositeType, DIDerivedType, DISubprogram, DIType},
 };
 
@@ -277,6 +275,24 @@ impl Drop for MetadataEntries {
     }
 }
 
+pub(crate) struct BasicBlockIter<'ctx> {
+    current: Option<LLVMBasicBlockRef>,
+    _lifetime: PhantomData<&'ctx ()>,
+}
+
+impl Iterator for BasicBlockIter<'_> {
+    type Item = LLVMBasicBlockRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.current.inspect(|&basic_block| {
+            // SAFETY: `LLVMBasicBlockRef` maps to exactly one LLVM C++ type
+            // (`BasicBlock`), so there is no possibility of a mismatch.
+            let current = unsafe { LLVMGetNextBasicBlock(basic_block) };
+            self.current = NonNull::new(current).map(|basic_block| basic_block.as_ptr());
+        })
+    }
+}
+
 /// Represents a function.
 #[derive(Clone)]
 pub(crate) struct Function<'ctx> {
@@ -311,7 +327,14 @@ impl<'ctx> Function<'ctx> {
     }
 
     pub(crate) fn basic_blocks(&self) -> impl Iterator<Item = LLVMBasicBlockRef> + '_ {
-        self.value_ref.basic_blocks_iter()
+        // SAFETY: We are sure that the provided `LLVMValueRef` is a
+        // `Function`.
+        let current = unsafe { LLVMGetFirstBasicBlock(self.value_ref) };
+        let current = NonNull::new(current).map(|function| function.as_ptr());
+        BasicBlockIter {
+            current,
+            _lifetime: PhantomData,
+        }
     }
 
     pub(crate) fn subprogram(&self, context: LLVMContextRef) -> Option<DISubprogram<'ctx>> {

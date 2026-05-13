@@ -1,10 +1,7 @@
 use std::marker::PhantomData;
 
 use llvm_sys::{
-    core::{
-        LLVMGetFirstBasicBlock, LLVMGetFirstInstruction, LLVMGetLastBasicBlock,
-        LLVMGetLastInstruction, LLVMGetNextBasicBlock, LLVMGetNextInstruction,
-    },
+    core::{LLVMGetFirstInstruction, LLVMGetLastInstruction, LLVMGetNextInstruction},
     prelude::{LLVMBasicBlockRef, LLVMValueRef},
 };
 
@@ -54,17 +51,6 @@ macro_rules! llvm_iterator {
         }
     };
 }
-
-llvm_iterator!(
-    IterBasicBlocks,
-    BasicBlockIter,
-    LLVMValueRef,
-    basic_blocks_iter,
-    LLVMBasicBlockRef,
-    LLVMGetFirstBasicBlock,
-    LLVMGetLastBasicBlock,
-    LLVMGetNextBasicBlock
-);
 
 llvm_iterator!(
     IterInstructions,
