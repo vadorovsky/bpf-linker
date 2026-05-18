@@ -190,21 +190,6 @@ pub(crate) struct MDNode<'ctx> {
 }
 
 impl MDNode<'_> {
-    /// Constructs a new [`MDNode`] from the given `metadata`.
-    ///
-    /// # Safety
-    ///
-    /// This method assumes that the given `metadata` corresponds to a valid
-    /// instance of [LLVM `MDNode`](https://llvm.org/doxygen/classllvm_1_1MDNode.html).
-    /// It's the caller's responsibility to ensure this invariant, as this
-    /// method doesn't perform any validation checks.
-    pub(crate) unsafe fn from_metadata_ref(
-        context: LLVMContextRef,
-        metadata: LLVMMetadataRef,
-    ) -> Self {
-        unsafe { MDNode::from_value_ref(LLVMMetadataAsValue(context, metadata)) }
-    }
-
     /// Constructs a new [`MDNode`] from the given `value`.
     ///
     /// # Safety
@@ -224,7 +209,8 @@ impl MDNode<'_> {
     pub(crate) fn empty(context: &LLVMContext) -> Self {
         let metadata =
             unsafe { LLVMMDNodeInContext2(context.as_mut_ptr(), core::ptr::null_mut(), 0) };
-        unsafe { Self::from_metadata_ref(context.as_mut_ptr(), metadata) }
+        let value = unsafe { LLVMMetadataAsValue(context.as_mut_ptr(), metadata) };
+        unsafe { Self::from_value_ref(value) }
     }
 
     /// Constructs a new metadata node from an array of [`DIType`] elements.
@@ -244,7 +230,8 @@ impl MDNode<'_> {
                 elements.len(),
             )
         };
-        unsafe { Self::from_metadata_ref(context.as_mut_ptr(), metadata) }
+        let value = unsafe { LLVMMetadataAsValue(context.as_mut_ptr(), metadata) };
+        unsafe { Self::from_value_ref(value) }
     }
 }
 
