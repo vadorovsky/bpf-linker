@@ -1,23 +1,21 @@
-use std::{
-    collections::{HashMap, HashSet},
-    ffi::CStr,
-};
+use std::{collections::HashMap, ffi::CStr};
 
 use gimli::{DW_TAG_array_type, DW_TAG_pointer_type, DW_TAG_union_type};
 use llvm_sys::{
     LLVMDbgRecordKind, LLVMOpcode, LLVMTypeKind,
     core::{
         LLVMArrayType2, LLVMConstInt, LLVMConstIntGetZExtValue, LLVMCreateTypeAttribute,
-        LLVMGetElementType, LLVMGetEnumAttributeKindForName, LLVMGetGEPSourceElementType,
-        LLVMGetInstructionOpcode, LLVMGetIntTypeWidth, LLVMGetIntrinsicDeclaration,
-        LLVMGetIntrinsicID, LLVMGetNumArgOperands, LLVMGetNumOperands, LLVMGetOperand,
-        LLVMGetTypeKind, LLVMInstructionEraseFromParent, LLVMInt8TypeInContext,
-        LLVMInt32TypeInContext, LLVMIntTypeInContext, LLVMIsAConstantInt, LLVMIsAInstruction,
-        LLVMLookupIntrinsicID, LLVMPointerType, LLVMReplaceAllUsesWith, LLVMSetOperand,
-        LLVMStructGetTypeAtIndex, LLVMStructTypeInContext, LLVMTypeOf,
+        LLVMGetElementType, LLVMGetEnumAttributeKindForName, LLVMGetFirstUse,
+        LLVMGetGEPSourceElementType, LLVMGetInstructionOpcode, LLVMGetIntTypeWidth,
+        LLVMGetIntrinsicDeclaration, LLVMGetIntrinsicID, LLVMGetNextUse, LLVMGetNumArgOperands,
+        LLVMGetNumOperands, LLVMGetOperand, LLVMGetTypeKind, LLVMGetUser,
+        LLVMInstructionEraseFromParent, LLVMInt8TypeInContext, LLVMInt32TypeInContext,
+        LLVMIntTypeInContext, LLVMIsAConstantInt, LLVMIsAInstruction, LLVMLookupIntrinsicID,
+        LLVMPointerType, LLVMReplaceAllUsesWith, LLVMStructGetTypeAtIndex, LLVMStructTypeInContext,
+        LLVMTypeOf,
     },
     debuginfo::{LLVMDITypeGetSizeInBits, LLVMGetMetadataKind, LLVMMetadataKind},
-    prelude::LLVMValueRef,
+    prelude::{LLVMTypeRef, LLVMValueRef},
 };
 use thiserror::Error;
 
@@ -25,9 +23,7 @@ use crate::llvm::{
     DataLayout, IRBuilder, LLVMContext, LLVMModule,
     types::{
         di::{DICompositeType, DIDerivedType, DISubroutineType},
-        instruction::{
-            CallInst, GetElementPtrInst, Instruction as _, InstructionKind, LoadInst, StoreInst,
-        },
+        instruction::{CallInst, Instruction as _, InstructionKind},
         ir::Metadata,
     },
 };
@@ -46,10 +42,11 @@ const PRESERVE_STRUCT_ACCESS_INTRINSIC_NAME: &CStr = c"llvm.preserve.struct.acce
 // selected member by field index without an `elementtype` attribute.
 const PRESERVE_UNION_ACCESS_INTRINSIC_NAME: &CStr = c"llvm.preserve.union.access.index";
 const DBG_VALUE_INTRINSIC_NAME: &CStr = c"llvm.dbg.value";
+const PRESERVE_ACCESS_MARKER_NAME: &[u8] = b"relocatable_preserve_access_index";
 const BITS_PER_BYTE: u64 = 8;
 const DILOCAL_VARIABLE_TYPE_OPERAND: u32 = 3;
 
-pub(crate) struct CoreRelocPass<'ctx, 'module, 'types> {
+pub(crate) struct CoreRelocPass<'ctx, 'module> {
     context: &'ctx LLVMContext,
     module: &'module mut LLVMModule<'ctx>,
     builder: IRBuilder<'ctx>,
@@ -57,9 +54,9 @@ pub(crate) struct CoreRelocPass<'ctx, 'module, 'types> {
     preserve_access_md_kind: u32,
     elementtype_attr_kind: u32,
     dbg_value_intrinsic_id: u32,
-    preserve_access_types: &'types HashSet<usize>,
+    preserve_access_marker_decl: Option<LLVMValueRef>,
     pointer_types: HashMap<LLVMValueRef, LLVMValueRef>,
-    synthetic_types: HashMap<LLVMValueRef, llvm_sys::prelude::LLVMTypeRef>,
+    synthetic_types: HashMap<LLVMValueRef, LLVMTypeRef>,
 }
 
 struct ResolvedAccess {
@@ -90,6 +87,10 @@ pub enum CoreRelocError {
     GepOffset(#[from] GepOffsetError),
     #[error("failed to build array access path: {0}")]
     ArrayAccess(#[from] ArrayAccessError),
+    #[error("preserve-access marker call is not based on a debuggable composite pointer")]
+    UnresolvedMarkerCall,
+    #[error("preserve-access marker call does not map to a supported field access")]
+    UnsupportedMarkerCall,
 }
 
 #[derive(Debug, Error)]
@@ -118,14 +119,14 @@ pub enum ArrayAccessError {
     IndexOverflow,
 }
 
-impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
-    pub(crate) fn new(
-        context: &'ctx LLVMContext,
-        module: &'module mut LLVMModule<'ctx>,
-        preserve_access_types: &'types HashSet<usize>,
-    ) -> Self {
+impl<'ctx, 'module> CoreRelocPass<'ctx, 'module> {
+    pub(crate) fn new(context: &'ctx LLVMContext, module: &'module mut LLVMModule<'ctx>) -> Self {
         let data_layout = module.data_layout();
         let preserve_access_md_kind = context.md_kind_id(PRESERVE_ACCESS_MD_NAME);
+        let preserve_access_marker_decl = module
+            .functions()
+            .find(|function| function.name() == PRESERVE_ACCESS_MARKER_NAME)
+            .map(|function| function.value_ref);
         Self {
             context,
             module,
@@ -141,7 +142,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
                     DBG_VALUE_INTRINSIC_NAME.to_bytes().len(),
                 )
             },
-            preserve_access_types,
+            preserve_access_marker_decl,
             pointer_types: HashMap::new(),
             synthetic_types: HashMap::new(),
         }
@@ -192,10 +193,8 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
             for bb in &basic_blocks {
                 for instruction in bb.instructions() {
                     match instruction {
-                        InstructionKind::LoadInst(load_inst) => self.rewrite_load(load_inst)?,
-                        InstructionKind::StoreInst(store_inst) => self.rewrite_store(store_inst)?,
-                        InstructionKind::GetElementPtrInst(gep_inst) => {
-                            self.rewrite_gep(gep_inst)?
+                        InstructionKind::CallInst(call_inst) => {
+                            self.rewrite_preserve_access_call(call_inst)?
                         }
                         _ => {}
                     }
@@ -322,72 +321,36 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         self.pointer_composite_from_metadata(unsafe { Metadata::from_value_ref(variable_type) })
     }
 
-    fn rewrite_load(&mut self, mut load: LoadInst<'_>) -> Result<(), CoreRelocError> {
-        let Some(resolved) = self.resolve_access(load.pointer())? else {
+    fn rewrite_preserve_access_call(&mut self, call: CallInst<'_>) -> Result<(), CoreRelocError> {
+        let Some(field_ptr) = self.preserve_access_marker_arg(&call) else {
             return Ok(());
         };
 
-        let Some(access_path) = self.build_access_path(
-            load.value_ref(),
-            resolved.base,
-            resolved.composite_type,
-            resolved.offset_bytes,
-            Some(unsafe { LLVMTypeOf(load.value_ref()) }),
-        )?
-        else {
-            return Ok(());
-        };
-        load.set_pointer(access_path.ptr);
-
-        if self.is_pointer_type(unsafe { LLVMTypeOf(load.value_ref()) })
-            && let Some(pointee) = access_path.nested_composite
-        {
-            let _prev = self.pointer_types.insert(load.value_ref(), pointee);
-        }
-
-        Ok(())
-    }
-
-    fn rewrite_store(&mut self, store: StoreInst<'_>) -> Result<(), CoreRelocError> {
-        let Some(resolved) = self.resolve_access(store.pointer())? else {
-            return Ok(());
-        };
-
-        let stored_value = store.value();
-        let Some(access_path) = self.build_access_path(
-            store.value_ref(),
-            resolved.base,
-            resolved.composite_type,
-            resolved.offset_bytes,
-            Some(unsafe { LLVMTypeOf(stored_value) }),
-        )?
-        else {
-            return Ok(());
-        };
-        unsafe { LLVMSetOperand(store.value_ref(), 1, access_path.ptr) };
-
-        Ok(())
-    }
-
-    fn rewrite_gep(&mut self, gep: GetElementPtrInst<'_>) -> Result<(), CoreRelocError> {
-        let Some(resolved) = self.resolve_access(gep.value_ref())? else {
-            return Ok(());
+        let Some(resolved) = self.resolve_access(field_ptr)? else {
+            return Err(CoreRelocError::UnresolvedMarkerCall);
         };
 
         let composite = unsafe { DICompositeType::from_value_ref(resolved.composite_type) };
-        if resolved.offset_bytes == 0 && composite.tag() != DW_TAG_array_type {
+        if resolved.offset_bytes == 0
+            && composite.tag() != DW_TAG_array_type
+            && composite.tag() != DW_TAG_union_type
+        {
+            unsafe {
+                LLVMReplaceAllUsesWith(call.value_ref(), resolved.base);
+                LLVMInstructionEraseFromParent(call.value_ref());
+            }
             return Ok(());
         }
 
         let Some(access_path) = self.build_access_path(
-            gep.value_ref(),
+            call.value_ref(),
             resolved.base,
             resolved.composite_type,
             resolved.offset_bytes,
-            None,
+            self.infer_expected_type_from_uses(call.value_ref()),
         )?
         else {
-            return Ok(());
+            return Err(CoreRelocError::UnsupportedMarkerCall);
         };
 
         if let Some(nested) = access_path.nested_composite {
@@ -395,11 +358,61 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         }
 
         unsafe {
-            LLVMReplaceAllUsesWith(gep.value_ref(), access_path.ptr);
-            LLVMInstructionEraseFromParent(gep.value_ref());
+            LLVMReplaceAllUsesWith(call.value_ref(), access_path.ptr);
+            LLVMInstructionEraseFromParent(call.value_ref());
         }
 
         Ok(())
+    }
+
+    fn preserve_access_marker_arg(&self, call: &CallInst<'_>) -> Option<LLVMValueRef> {
+        let callee = call.called_value();
+        if callee.is_null() || Some(callee) != self.preserve_access_marker_decl {
+            return None;
+        }
+        let num_operands = unsafe { LLVMGetNumOperands(call.value_ref()) };
+        match num_operands {
+            2 => Some(unsafe { LLVMGetOperand(call.value_ref(), 0) }),
+            _ => None,
+        }
+    }
+
+    fn infer_expected_type_from_uses(&self, value: LLVMValueRef) -> Option<LLVMTypeRef> {
+        let mut expected_type = None;
+        let mut use_ref = unsafe { LLVMGetFirstUse(value) };
+
+        while !use_ref.is_null() {
+            let user = unsafe { LLVMGetUser(use_ref) };
+            let candidate = self.expected_type_from_user(value, user);
+            match (expected_type, candidate) {
+                (None, Some(candidate)) => expected_type = Some(candidate),
+                (Some(expected), Some(candidate)) if expected != candidate => return None,
+                _ => {}
+            }
+            use_ref = unsafe { LLVMGetNextUse(use_ref) };
+        }
+
+        expected_type
+    }
+
+    fn expected_type_from_user(
+        &self,
+        value: LLVMValueRef,
+        user: LLVMValueRef,
+    ) -> Option<LLVMTypeRef> {
+        if unsafe { LLVMIsAInstruction(user).is_null() } {
+            return None;
+        }
+
+        match unsafe { LLVMGetInstructionOpcode(user) } {
+            LLVMOpcode::LLVMLoad => Some(unsafe { LLVMTypeOf(user) }),
+            LLVMOpcode::LLVMStore => (unsafe { LLVMGetOperand(user, 1) } == value)
+                .then(|| unsafe { LLVMTypeOf(LLVMGetOperand(user, 0)) }),
+            LLVMOpcode::LLVMBitCast
+            | LLVMOpcode::LLVMAddrSpaceCast
+            | LLVMOpcode::LLVMGetElementPtr => self.infer_expected_type_from_uses(user),
+            _ => None,
+        }
     }
 
     fn resolve_access(
@@ -500,7 +513,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         &self,
         composite_type: LLVMValueRef,
         offset_bytes: u64,
-        expected_type: Option<llvm_sys::prelude::LLVMTypeRef>,
+        expected_type: Option<LLVMTypeRef>,
     ) -> Option<FieldMatch> {
         let composite = unsafe { DICompositeType::from_value_ref(composite_type) };
         let offset_bits = offset_bytes.checked_mul(BITS_PER_BYTE)?;
@@ -532,7 +545,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
     fn member_matches_llvm_type(
         &self,
         member: &DIDerivedType<'_>,
-        expected_type: llvm_sys::prelude::LLVMTypeRef,
+        expected_type: LLVMTypeRef,
     ) -> bool {
         self.metadata_matches_llvm_type(member.base_type(), expected_type)
     }
@@ -540,7 +553,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
     fn metadata_matches_llvm_type(
         &self,
         metadata: Metadata<'_>,
-        expected_type: llvm_sys::prelude::LLVMTypeRef,
+        expected_type: LLVMTypeRef,
     ) -> bool {
         match unsafe { LLVMGetTypeKind(expected_type) } {
             LLVMTypeKind::LLVMPointerTypeKind => {
@@ -588,13 +601,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         }
 
         match pointer_type.base_type() {
-            Metadata::DICompositeType(composite)
-                if self
-                    .preserve_access_types
-                    .contains(&(composite.value_ref() as usize)) =>
-            {
-                Some(composite.value_ref())
-            }
+            Metadata::DICompositeType(composite) => Some(composite.value_ref()),
             _ => None,
         }
     }
@@ -648,7 +655,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         index: u32,
     ) -> Option<CallInst<'ctx>> {
         let callee = self.preserve_array_access_function(base);
-        let element_type = self.synthetic_llvm_type(composite_type.base_type()?)?;
+        let element_type = self.synthetic_array_type(composite_type.value_ref())?;
         let dimension =
             unsafe { LLVMConstInt(LLVMInt32TypeInContext(self.context.as_mut_ptr()), 1, 0) };
         let last_index = unsafe {
@@ -730,17 +737,14 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         }
     }
 
-    fn is_pointer_type(&self, ty: llvm_sys::prelude::LLVMTypeRef) -> bool {
+    fn is_pointer_type(&self, ty: LLVMTypeRef) -> bool {
         matches!(
             unsafe { LLVMGetTypeKind(ty) },
             LLVMTypeKind::LLVMPointerTypeKind
         )
     }
 
-    fn synthetic_struct_type(
-        &mut self,
-        composite_type: LLVMValueRef,
-    ) -> Option<llvm_sys::prelude::LLVMTypeRef> {
+    fn synthetic_struct_type(&mut self, composite_type: LLVMValueRef) -> Option<LLVMTypeRef> {
         if let Some(&ty) = self.synthetic_types.get(&composite_type) {
             return Some(ty);
         }
@@ -767,10 +771,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         Some(ty)
     }
 
-    fn synthetic_array_type(
-        &mut self,
-        composite_type: LLVMValueRef,
-    ) -> Option<llvm_sys::prelude::LLVMTypeRef> {
+    fn synthetic_array_type(&mut self, composite_type: LLVMValueRef) -> Option<LLVMTypeRef> {
         if let Some(&ty) = self.synthetic_types.get(&composite_type) {
             return Some(ty);
         }
@@ -787,10 +788,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         Some(ty)
     }
 
-    fn synthetic_llvm_type(
-        &mut self,
-        metadata: Metadata<'_>,
-    ) -> Option<llvm_sys::prelude::LLVMTypeRef> {
+    fn synthetic_llvm_type(&mut self, metadata: Metadata<'_>) -> Option<LLVMTypeRef> {
         match metadata {
             Metadata::DIDerivedType(derived) if derived.tag() == DW_TAG_pointer_type => {
                 Some(unsafe {
@@ -836,7 +834,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         base: LLVMValueRef,
         composite_type: LLVMValueRef,
         offset_bytes: u64,
-        expected_type: Option<llvm_sys::prelude::LLVMTypeRef>,
+        expected_type: Option<LLVMTypeRef>,
     ) -> Result<Option<AccessPath>, CoreRelocError> {
         let composite = unsafe { DICompositeType::from_value_ref(composite_type) };
         if composite.tag() == DW_TAG_array_type {
@@ -895,7 +893,7 @@ impl<'ctx, 'module, 'types> CoreRelocPass<'ctx, 'module, 'types> {
         base: LLVMValueRef,
         composite: &DICompositeType<'_>,
         offset_bytes: u64,
-        expected_type: Option<llvm_sys::prelude::LLVMTypeRef>,
+        expected_type: Option<LLVMTypeRef>,
     ) -> Result<Option<AccessPath>, CoreRelocError> {
         let element_size_bits = self
             .metadata_size_in_bits(

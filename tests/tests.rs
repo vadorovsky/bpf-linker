@@ -239,6 +239,14 @@ fn compile_test() {
             "assembly",
             &bpf_sysroot,
             Some(|cfg: &mut compiletest_rs::Config| {
+                cfg.src_base = PathBuf::from("tests/nightly/assembly");
+            }),
+        );
+        run_mode(
+            target,
+            "assembly",
+            &bpf_sysroot,
+            Some(|cfg: &mut compiletest_rs::Config| {
                 cfg.src_base = PathBuf::from("tests/nightly/btf");
                 cfg.llvm_filecheck_preprocess = Some(btf_dump);
             }),

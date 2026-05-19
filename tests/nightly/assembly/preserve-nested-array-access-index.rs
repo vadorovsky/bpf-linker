@@ -3,16 +3,21 @@
 
 #![no_std]
 
-use core::{marker::PhantomData, panic::PanicInfo};
+use core::panic::PanicInfo;
+
+unsafe extern "C" {
+    fn relocatable_preserve_access_index(ptr: *const u32) -> *const u32;
+}
+
+#[inline(always)]
+unsafe fn preserve_access_index<T>(ptr: *const T) -> *const T {
+    unsafe { relocatable_preserve_access_index(ptr.cast()) }.cast()
+}
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
 }
-
-#[repr(transparent)]
-#[derive(Copy, Clone)]
-pub struct Relocatable(PhantomData<()>);
 
 #[repr(C)]
 pub struct Bar {
@@ -23,8 +28,6 @@ pub struct Bar {
 #[repr(C)]
 pub struct Foo {
     arr: [Bar; 4],
-
-    _marker: Relocatable,
 }
 
 // CHECK: @"llvm.Foo:0:20$0:0:2:1" = external global i64, !llvm.preserve.access.index ![[FOO:[0-9]+]] #[[AMA:[0-9]+]]
@@ -36,8 +39,8 @@ pub unsafe extern "C" fn get_arr_2_y(x: *const Foo) -> u32 {
     // CHECK: %[[OFF:[0-9]+]] = load i64, ptr @"llvm.Foo:0:20$0:0:2:1", align 8
     // CHECK-NEXT: %[[FIELD_PTR:[0-9]+]] = getelementptr i8, ptr %{{.*}}, i64 %[[OFF]]
     // CHECK-NEXT: %[[PASSTHROUGH:[0-9]+]] = tail call ptr @llvm.bpf.passthrough{{.*}}(i32 {{[0-9]+}}, ptr %[[FIELD_PTR]])
-    // CHECK-NEXT: %{{.*}} = load i32, ptr %[[PASSTHROUGH]], align 4
-    (*x).arr[2].y
+    // CHECK: %{{.*}} = load i32, ptr %[[PASSTHROUGH]], align 4
+    *preserve_access_index(core::ptr::addr_of!((*x).arr[2].y))
 }
 
 // CHECK: attributes #[[AMA]] = { "btf_ama" }

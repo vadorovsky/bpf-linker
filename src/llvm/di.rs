@@ -27,12 +27,7 @@ pub(crate) struct DISanitizer<'ctx> {
     visited_nodes: HashSet<u64>,
     replace_subprograms: HashMap<u64, DISubprogram<'ctx>>,
     skipped_types_lossy: Vec<String>,
-    preserve_access_types: HashSet<usize>,
 }
-
-/// The marker type name that opts a composite type into CO-RE/BTF relocation
-/// emission when it appears as one of the type's fields.
-const RELOCATABLE_MARKER_TYPE: &[u8] = b"Relocatable";
 
 // Sanitize Rust type names to be valid C type names.
 fn sanitize_type_name(name: &[u8]) -> Vec<u8> {
@@ -68,7 +63,6 @@ impl<'ctx> DISanitizer<'ctx> {
             visited_nodes: HashSet::new(),
             replace_subprograms: HashMap::new(),
             skipped_types_lossy: Vec::new(),
-            preserve_access_types: HashSet::new(),
         }
     }
 
@@ -124,29 +118,7 @@ impl<'ctx> DISanitizer<'ctx> {
                                     }
                                 }
                                 Metadata::DIDerivedType(di_derived_type) => {
-                                    let base_type = di_derived_type.base_type();
-
-                                    match base_type {
-                                        Metadata::DICompositeType(base_type_di_composite_type) => {
-                                            if let Some(base_type_name) =
-                                                base_type_di_composite_type.name()
-                                            {
-                                                if base_type_name == RELOCATABLE_MARKER_TYPE {
-                                                    let _is_new =
-                                                        self.preserve_access_types
-                                                            .insert(di_composite_type.value_ref()
-                                                                as usize);
-                                                } else {
-                                                    members.push(di_derived_type.into());
-                                                }
-                                            } else {
-                                                members.push(di_derived_type.into());
-                                            }
-                                        }
-                                        _ => {
-                                            members.push(di_derived_type.into());
-                                        }
-                                    }
+                                    members.push(di_derived_type.into());
                                 }
                                 _ => {}
                             }
@@ -259,7 +231,7 @@ impl<'ctx> DISanitizer<'ctx> {
         }
     }
 
-    pub(crate) fn run(mut self, exported_symbols: &HashSet<Cow<'_, [u8]>>) -> HashSet<usize> {
+    pub(crate) fn run(mut self, exported_symbols: &HashSet<Cow<'_, [u8]>>) {
         let module = self.module;
 
         self.replace_subprograms = self.fix_subprogram_linkage(exported_symbols);
@@ -281,8 +253,6 @@ impl<'ctx> DISanitizer<'ctx> {
                 self.skipped_types_lossy.join(", ")
             );
         }
-
-        self.preserve_access_types.clone()
     }
 
     // Make it so that only exported symbols (programs marked as #[no_mangle]) get BTF

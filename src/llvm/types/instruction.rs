@@ -141,6 +141,7 @@ impl<'ctx> Instruction<'ctx> for GetElementPtrInst<'ctx> {
 
 #[repr(u32)]
 #[cfg(feature = "llvm-22")]
+#[expect(dead_code, reason = "kept for alternative CO-RE rewrite strategies")]
 enum LoadInstOperand {
     /// The pointer being accessed by the load instruction. Reference in
     /// [LLVM 22][llvm-22].
@@ -162,11 +163,13 @@ impl LoadInst<'_> {
         }
     }
 
+    #[expect(dead_code, reason = "kept for alternative CO-RE rewrite strategies")]
     #[cfg(feature = "llvm-22")]
     pub(crate) fn pointer(&self) -> LLVMValueRef {
         unsafe { LLVMGetOperand(self.value_ref, LoadInstOperand::Pointer as u32) }
     }
 
+    #[expect(dead_code, reason = "kept for alternative CO-RE rewrite strategies")]
     #[cfg(feature = "llvm-22")]
     pub(crate) fn set_pointer(&mut self, value_ref: LLVMValueRef) {
         unsafe {
@@ -185,6 +188,7 @@ impl<'ctx> Instruction<'ctx> for LoadInst<'ctx> {
 /// the operand indices within metadata index.
 #[repr(u32)]
 #[cfg(feature = "llvm-22")]
+#[expect(dead_code, reason = "kept for alternative CO-RE rewrite strategies")]
 enum StoreInstOperand {
     /// The value being written by the store instruction. Reference in
     /// [LLVM 22][llvm-22].
@@ -211,11 +215,13 @@ impl StoreInst<'_> {
         }
     }
 
+    #[expect(dead_code, reason = "kept for alternative CO-RE rewrite strategies")]
     #[cfg(feature = "llvm-22")]
     pub(crate) fn value(&self) -> LLVMValueRef {
         unsafe { LLVMGetOperand(self.value_ref, StoreInstOperand::Value as u32) }
     }
 
+    #[expect(dead_code, reason = "kept for alternative CO-RE rewrite strategies")]
     #[cfg(feature = "llvm-22")]
     pub(crate) fn pointer(&self) -> LLVMValueRef {
         unsafe { LLVMGetOperand(self.value_ref, StoreInstOperand::Pointer as u32) }
