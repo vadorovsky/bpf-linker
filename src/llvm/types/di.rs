@@ -231,10 +231,6 @@ impl DIDerivedType<'_> {
         unsafe { llvm_sys::debuginfo::LLVMDITypeGetSizeInBits(self.metadata_ref) }
     }
 
-    #[cfg(feature = "llvm-22")]
-    pub(crate) const fn value_ref(&self) -> LLVMValueRef {
-        self.value_ref
-    }
 }
 
 /// Represents the operands for a [`DICompositeType`]. The enum values
