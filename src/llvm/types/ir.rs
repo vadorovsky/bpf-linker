@@ -171,12 +171,10 @@ impl Metadata<'_> {
     }
 }
 
-impl<'ctx> TryFrom<MDNode<'ctx>> for Metadata<'ctx> {
-    type Error = ();
-
-    fn try_from(md_node: MDNode<'_>) -> Result<Self, Self::Error> {
-        // FIXME: fail if md_node isn't a Metadata node
-        Ok(unsafe { Self::from_value_ref(md_node.value_ref) })
+impl<'ctx> From<MDNode<'ctx>> for Metadata<'ctx> {
+    fn from(md_node: MDNode<'_>) -> Self {
+        // SAFETY: `MDNode` is a subclass of `Metadata`.
+        unsafe { Self::from_value_ref(md_node.value_ref) }
     }
 }
 

@@ -68,7 +68,7 @@ impl<'ctx> DISanitizer<'ctx> {
     }
 
     fn visit_mdnode(&mut self, mdnode: MDNode<'_>) {
-        match mdnode.try_into().expect("MDNode is not Metadata") {
+        match Metadata::from(mdnode) {
             Metadata::DICompositeType(mut di_composite_type) => {
                 #[expect(clippy::single_match)]
                 #[expect(non_upper_case_globals)]
