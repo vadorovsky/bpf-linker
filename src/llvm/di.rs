@@ -88,6 +88,7 @@ impl<'ctx> DISanitizer<'ctx> {
                         let mut is_data_carrying_enum = false;
                         let mut members: Vec<DIType<'_>> = Vec::new();
                         for element in di_composite_type.elements() {
+                            let element = element;
                             match element {
                                 Metadata::DICompositeType(di_composite_type_inner) => {
                                     // The presence of a composite type with `DW_TAG_variant_part`
@@ -338,8 +339,8 @@ impl<'ctx> DISanitizer<'ctx> {
             subprogram.set_retained_nodes(empty_node);
 
             assert_eq!(
-                replace.insert(subprogram.value_ref as u64, unsafe {
-                    LLVMValueAsMetadata(new_program.value_ref)
+                replace.insert(subprogram.value.as_ptr() as u64, unsafe {
+                    LLVMValueAsMetadata(new_program.value.as_ptr())
                 }),
                 None
             );

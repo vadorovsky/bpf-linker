@@ -1,6 +1,7 @@
 use std::{marker::PhantomData, ptr::NonNull};
 
 use llvm_sys::{
+    LLVMValue,
     core::{
         LLVMCountParams, LLVMDisposeValueMetadataEntries, LLVMGetFirstBasicBlock,
         LLVMGetNextBasicBlock, LLVMGetNumOperands, LLVMGetOperand, LLVMGetParam,
@@ -17,8 +18,66 @@ use llvm_sys::{
 
 use crate::llvm::{
     LLVMContext, Message, symbol_name,
-    types::di::{DICompositeType, DIDerivedType, DISubprogram, DIType},
+    types::{
+        LLVMTypeError,
+        di::{DICompositeType, DIDerivedType, DISubprogram, DIType},
+    },
 };
+
+/// A trait for wrappers that represent LLVM `Value` subclasses.
+pub(crate) trait ValueLike
+where
+    Self: Sized,
+{
+    const TYPE_NAME: &'static str;
+
+    /// Returns whether the provided value pointer has the LLVM runtime type
+    /// expected by this wrapper.
+    fn check_value_type(value: NonNull<LLVMValue>) -> bool;
+
+    /// Constructs a new [`Self`] from a non-null LLVM value without checking
+    /// its runtime type.
+    ///
+    /// # Safety
+    ///
+    /// The provided value must be a valid instance of the LLVM type represented
+    /// by this wrapper.
+    unsafe fn from_non_null_unchecked(value: NonNull<LLVMValue>) -> Self;
+
+    /// Constructs a new [`Self`] from a raw LLVM value after checking its
+    /// runtime type.
+    fn from_raw(value: LLVMValueRef) -> Result<Self, LLVMTypeError> {
+        let value = NonNull::new(value).ok_or_else(|| LLVMTypeError::NullPtr(Self::TYPE_NAME))?;
+        Self::from_non_null(value)
+    }
+
+    /// Constructs a new [`Self`] from a raw LLVM value without checking its
+    /// runtime type.
+    ///
+    /// This method still rejects null pointers.
+    ///
+    /// # Safety
+    ///
+    /// If the provided value must:
+    ///
+    /// - Not be `NULL`.
+    /// - Be a valid instance of the LLVM type represented by this wrapper.
+    unsafe fn from_raw_unchecked(value: LLVMValueRef) -> Result<Self, LLVMTypeError> {
+        let value = NonNull::new(value).ok_or_else(|| LLVMTypeError::NullPtr(Self::TYPE_NAME))?;
+        Ok(unsafe { Self::from_non_null_unchecked(value) })
+    }
+
+    /// Constructs a new [`Self`] from a non-null LLVM value after checking its
+    /// runtime type.
+    fn from_non_null(value: NonNull<LLVMValue>) -> Result<Self, LLVMTypeError> {
+        if Self::check_value_type(value) {
+            // SAFETY: We checked that the type matches.
+            Ok(unsafe { Self::from_non_null_unchecked(value) })
+        } else {
+            Err(LLVMTypeError::IncorrectType)
+        }
+    }
+}
 
 pub(crate) fn replace_name(
     value_ref: LLVMValueRef,
@@ -101,7 +160,7 @@ pub(crate) enum Metadata<'ctx> {
     DICompositeType(DICompositeType<'ctx>),
     DIDerivedType(DIDerivedType<'ctx>),
     DISubprogram(DISubprogram<'ctx>),
-    Other(#[expect(dead_code)] LLVMValueRef),
+    Other(#[expect(dead_code)] NonNull<LLVMValue>),
 }
 
 impl Metadata<'_> {
@@ -113,21 +172,34 @@ impl Metadata<'_> {
     /// instance of [LLVM `Metadata`](https://llvm.org/doxygen/classllvm_1_1Metadata.html).
     /// It's the caller's responsibility to ensure this invariant, as this
     /// method doesn't perform any valiation checks.
-    pub(crate) unsafe fn from_value_ref(value: LLVMValueRef) -> Self {
+    pub(crate) unsafe fn from_raw(value: LLVMValueRef) -> Result<Self, LLVMTypeError> {
+        let value = NonNull::new(value).ok_or_else(|| LLVMTypeError::NullPtr("Value"))?;
+        Ok(unsafe { Self::from_non_null(value) })
+    }
+
+    /// Constructs a new [`Metadata`] from the given `value`.
+    ///
+    /// # Safety
+    ///
+    /// This method assumes that the provided `value` corresponds to a valid
+    /// instance of [LLVM `Metadata`](https://llvm.org/doxygen/classllvm_1_1Metadata.html).
+    /// It's the caller's responsibility to ensure this invariant, as this
+    /// method doesn't perform any valiation checks.
+    unsafe fn from_non_null(value: NonNull<LLVMValue>) -> Self {
         unsafe {
-            let metadata = LLVMValueAsMetadata(value);
+            let metadata = LLVMValueAsMetadata(value.as_ptr());
 
             match LLVMGetMetadataKind(metadata) {
                 LLVMMetadataKind::LLVMDICompositeTypeMetadataKind => {
-                    let di_composite_type = DICompositeType::from_value_ref(value);
+                    let di_composite_type = DICompositeType::from_non_null_unchecked(value);
                     Metadata::DICompositeType(di_composite_type)
                 }
                 LLVMMetadataKind::LLVMDIDerivedTypeMetadataKind => {
-                    let di_derived_type = DIDerivedType::from_value_ref(value);
+                    let di_derived_type = DIDerivedType::from_non_null_unchecked(value);
                     Metadata::DIDerivedType(di_derived_type)
                 }
                 LLVMMetadataKind::LLVMDISubprogramMetadataKind => {
-                    let di_subprogram = DISubprogram::from_value_ref(value);
+                    let di_subprogram = DISubprogram::from_non_null_unchecked(value);
                     Metadata::DISubprogram(di_subprogram)
                 }
                 LLVMMetadataKind::LLVMDIGlobalVariableMetadataKind
@@ -174,7 +246,9 @@ impl Metadata<'_> {
 impl<'ctx> From<MDNode<'ctx>> for Metadata<'ctx> {
     fn from(md_node: MDNode<'_>) -> Self {
         // SAFETY: `MDNode` is a subclass of `Metadata`.
-        unsafe { Self::from_value_ref(md_node.value_ref) }
+        unsafe {
+            Self::from_raw(md_node.value_ref).expect("MDNode's `value_ref` should not be null")
+        }
     }
 }
 
@@ -218,7 +292,7 @@ impl MDNode<'_> {
         let metadata = unsafe {
             let mut elements: Vec<LLVMMetadataRef> = elements
                 .iter()
-                .map(|di_type| LLVMValueAsMetadata(di_type.value_ref))
+                .map(|di_type| LLVMValueAsMetadata(di_type.value.as_ptr()))
                 .collect();
             LLVMMDNodeInContext2(
                 context.as_mut_ptr(),
@@ -338,11 +412,18 @@ impl<'ctx> Function<'ctx> {
     pub(crate) fn subprogram(&self, context: LLVMContextRef) -> Option<DISubprogram<'ctx>> {
         let subprogram = unsafe { LLVMGetSubprogram(self.value_ref) };
         (!subprogram.is_null()).then(|| unsafe {
-            DISubprogram::from_value_ref(LLVMMetadataAsValue(context, subprogram))
+            DISubprogram::from_raw(LLVMMetadataAsValue(context, subprogram)).expect(
+                "subprogram belonging to a non-null function should be a correct non-null pointer",
+            )
         })
     }
 
     pub(crate) fn set_subprogram(&mut self, subprogram: &DISubprogram<'_>) {
-        unsafe { LLVMSetSubprogram(self.value_ref, LLVMValueAsMetadata(subprogram.value_ref)) };
+        unsafe {
+            LLVMSetSubprogram(
+                self.value_ref,
+                LLVMValueAsMetadata(subprogram.value.as_ptr()),
+            )
+        };
     }
 }

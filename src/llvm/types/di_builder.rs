@@ -9,7 +9,10 @@ use llvm_sys::{
     prelude::{LLVMDIBuilderRef, LLVMMetadataRef},
 };
 
-use crate::llvm::{LLVMContext, LLVMModule, types::di::DISubprogram};
+use crate::llvm::{
+    LLVMContext, LLVMModule,
+    types::{di::DISubprogram, ir::ValueLike as _},
+};
 
 pub(crate) struct DIBuilder<'ctx> {
     builder: LLVMDIBuilderRef,
@@ -65,7 +68,8 @@ impl<'ctx> DIBuilder<'ctx> {
         };
 
         unsafe {
-            DISubprogram::from_value_ref(LLVMMetadataAsValue(context.as_mut_ptr(), subprogram))
+            DISubprogram::from_raw_unchecked(LLVMMetadataAsValue(context.as_mut_ptr(), subprogram))
+                .expect("a newly created function should not be null")
         }
     }
 
@@ -73,7 +77,7 @@ impl<'ctx> DIBuilder<'ctx> {
         unsafe {
             LLVMDIBuilderFinalizeSubprogram(
                 self.builder,
-                llvm_sys::core::LLVMValueAsMetadata(subprogram.value_ref),
+                llvm_sys::core::LLVMValueAsMetadata(subprogram.value.as_ptr()),
             )
         };
     }
