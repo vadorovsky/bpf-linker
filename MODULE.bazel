@@ -22,21 +22,21 @@ single_version_override(
 )
 
 # @llvm-project uses the rust-lang/llvm-project commit referenced by
-# nightly-2026-08-12.
+# nightly-2026-09-05.
 llvm = use_extension("@llvm//extensions:llvm.bzl", "llvm")
 
 # llvm.version only sets generated LLVM version constants; from_archive
 # below selects the LLVM source archive.
-llvm.version(llvm_version = "23.1.0")
+llvm.version(llvm_version = "23.1.1")
 llvm.from_archive(
-    integrity = "sha256-yAiqllLCuJsbFtkQLzmBO5nCj/qX+GMljEU3w7VE/Zs=",
+    integrity = "sha256-UkMfP/TER/UgHgcpI9+bPD1pUUSR9aVPAF/oWq/eIgU=",
     patch_args = ["-p1"],
     patches = [
         "@llvm//3rd_party/llvm-project/x.x/patches:llvm-http-windows-gnu.patch",
         "@llvm//3rd_party/llvm-project/x.x/patches:llvm-extra.patch",
     ],
-    strip_prefix = "llvm-project-21cf28432798952d942bacc6bcee3a328faa3638",
-    urls = ["https://github.com/rust-lang/llvm-project/archive/21cf28432798952d942bacc6bcee3a328faa3638.tar.gz"],
+    strip_prefix = "llvm-project-76a3a9d0075fe0df4bb57160372700006e3d0b2b",
+    urls = ["https://github.com/rust-lang/llvm-project/archive/76a3a9d0075fe0df4bb57160372700006e3d0b2b.tar.gz"],
 )
 use_repo(llvm, "llvm-project")
 
