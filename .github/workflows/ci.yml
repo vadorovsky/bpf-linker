@@ -236,6 +236,18 @@ jobs:
               --run_under=//bazel:qemu-riscv64
               --test_lang_filters=rust
               --build_tests_only
+          # BuildBuddy workers run Linux, so Windows test executables and
+          # genrules that invoke the host shell must run on the GitHub-hosted
+          # Windows runner. Compilation remains remote.
+          # Bazel's Windows shell-test launcher does not build with the gnullvm
+          # toolchain, so run only tests that produce native Rust executables.
+          - os: windows-latest
+            target: x86_64-pc-windows-gnullvm
+            test_options: >-
+              --test_lang_filters=rust
+              --build_tests_only
+              --genrule_strategy=local
+              --strategy=TestRunner=local
     defaults:
       run:
         shell: bash
@@ -243,6 +255,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Check Starlark
+        if: runner.os != 'Windows'
         run: bazel run //bazel/format:format.check
 
       - name: Check production target without dev dependencies
