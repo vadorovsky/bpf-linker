@@ -81,17 +81,17 @@ toolchains.toolchain(
 toolchains.toolchain(
     name = "stable_rust_toolchains",
     edition = "2024",
-    version = "1.98.1",
+    version = "1.99.0",
 )
 toolchains.toolchain(
     name = "beta_rust_toolchains",
     edition = "2024",
-    version = "beta/2026-09-20",
+    version = "beta/2026-10-03",
 )
 toolchains.toolchain(
     name = "nightly_rust_toolchains",
     edition = "2024",
-    version = "nightly/2026-09-24",
+    version = "nightly/2026-10-03",
 )
 use_repo(
     toolchains,
